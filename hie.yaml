@@ -1,0 +1,10 @@
+cradle:
+  cabal:
+    - path: "./src"
+      component: "lib:temple"
+
+    - path: "./app/Main.hs"
+      component: "temple:exe:temple"
+
+    - path: "./test"
+      component: "temple:test:temple-tests"
