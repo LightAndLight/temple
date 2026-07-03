@@ -32,14 +32,15 @@ module Temple
   , InferT
   , InferState (..)
   , emptyInferState
+  , Requirement (..)
   , getRequirements
   , InferEnv (..)
   , emptyInferEnv
   , runInferT
-  , inferTemplate
+  , checkTemplate
   , inferExpr
   , checkExpr
-  , inferPart
+  , checkPart
   , zonkDefault
   , zonkNoDefault
 
@@ -61,17 +62,20 @@ import Control.Applicative (empty, many, optional, some, (<|>))
 import Control.Monad (guard, unless, when)
 import Control.Monad.Error.Class (MonadError, throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (ReaderT, runReaderT)
 import Control.Monad.Reader.Class (MonadReader, asks, local)
 import Control.Monad.State (StateT, runStateT)
 import Control.Monad.State.Class (get, gets, modify, put)
+import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Char as Char
 import Data.Foldable (for_, traverse_)
+import Data.Functor (void)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
-import Data.List (intercalate)
+import Data.List (find, intercalate)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
@@ -83,10 +87,26 @@ import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Data.Tuple as Tuple
+import System.FilePath (takeDirectory, (</>))
 import Text.Sage (Parser, char, notFollowedBy, satisfy, sepBy, skipMany, string, try, (<?>))
 import qualified Text.Sage as Sage
 
-newtype Template = Template [Part]
+data Template
+  = TemplateBase
+      -- | Template path (absolute)
+      !FilePath
+      [Part]
+  | TemplateChild
+      -- | Template path (absolute)
+      !FilePath
+      -- | Parent template
+      !(Located FilePath)
+      ![Pragma]
+  deriving (Show, Eq)
+
+data Pragma
+  = PragmaBlock !(Located Text) ![Part]
+  | PragmaWith ![(Located Text, Located Expr)]
   deriving (Show, Eq)
 
 data Part
@@ -135,9 +155,37 @@ data Pattern
   = PConstructor !Text ![Text]
   deriving (Show, Eq)
 
-templateParser :: Parser Template
-templateParser =
-  Template <$> many partParser
+templateParser :: FilePath -> Parser Template
+templateParser path =
+  TemplateChild path <$> pragmaExtendsParser <*> many pragmaParser
+    <|> TemplateBase path <$> many partParser
+  where
+    pragmaExtendsParser =
+      between
+        openPragmaParser
+        (token closePragmaParser)
+        (symbol (fromString "extends") *> locatedParser stringLiteralParser)
+
+openPragmaParser :: Parser ()
+openPragmaParser = void . symbol $ fromString "{%"
+
+closePragmaParser :: Parser ()
+closePragmaParser =
+  void . string $ fromString "%}"
+
+pragmaParser :: Parser Pragma
+pragmaParser =
+  between openPragmaParser (token closePragmaParser) $
+    ( do
+        _ <- symbol $ fromString "block"
+        name <- locatedParser identParser <* token closePragmaParser
+        template <- many partParser
+        openPragmaParser <* symbol (fromString "end") <* symbol (locatedValue name)
+        pure $ PragmaBlock name template
+    )
+      <|> PragmaWith
+        <$ symbol (fromString "with")
+        <*> commaSep ((,) <$> locatedParser identParser <* symbolic '=' <*> exprParser)
 
 noneOf :: String -> Parser Char
 noneOf cs = satisfy (`notElem` cs)
@@ -164,17 +212,20 @@ partParser :: Parser Part
 partParser =
   PartText . Text.pack
     <$> some
-      ( noneOf "\\$"
-          <|> (char '\\' *> (char '\\' <|> char '$'))
+      ( noneOf "\\{}"
+          <|> try (char '{' <* notFollowedBy (char '{' <|> char '%'))
+          <|> try (char '}' <* notFollowedBy (char '}'))
+          <|> (char '\\' *> (char '\\' <|> char '{' <|> char '}'))
       )
     <|> partExprParser
 
 partExprParser :: Parser Part
 partExprParser =
   ($)
-    <$ char '$'
-    <*> token (PartExprStream <$ char '$' <|> pure PartExpr)
-    <*> between (symbolic '(') (char ')') exprParser
+    <$ symbol (fromString "{{")
+    <*> token (PartExprStream <$ symbolic '*' <|> pure PartExpr)
+    <*> exprParser
+    <* string (fromString "}}")
 
 kIf, kThen, kElse, kFor, kIn, kYield, kMatch :: Text
 kIf = fromString "if"
@@ -211,8 +262,8 @@ exprParser =
     <|> locatedParser forParser
   where
     recordParser =
-      Record <$>
-        between
+      Record
+        <$> between
           (symbolic '{')
           (symbolic '}')
           (commaSep $ (,) <$> identParser <* symbolic '=' <*> exprParser)
@@ -231,6 +282,19 @@ exprParser =
 
     forParser =
       For <$ symbol kFor <*> identParser <* symbol kIn <*> exprParser <* symbol kYield <*> exprParser
+
+stringLiteralParser :: Parser String
+stringLiteralParser =
+  token $
+    between
+      (char '"')
+      (char '"')
+      ( many $
+          noneOf "\\{}\"\n"
+            <|> try (char '{' <* notFollowedBy (char '{'))
+            <|> try (char '}' <* notFollowedBy (char '}'))
+            <|> char '\\' *> (char '\\' <|> char '{' <|> char '}' <|> char '"' <|> ('\n' <$ char 'n'))
+      )
 
 atomParser :: Parser (Located Expr)
 atomParser =
@@ -256,8 +320,10 @@ atomParser =
               fmap
                 (PartText . Text.pack)
                 ( some $
-                    noneOf "\\$\"\n"
-                      <|> char '\\' *> (char '\\' <|> char '$' <|> char '"' <|> ('\n' <$ char 'n'))
+                    noneOf "\\{}\"\n"
+                      <|> try (char '{' <* notFollowedBy (char '{'))
+                      <|> try (char '}' <* notFollowedBy (char '}'))
+                      <|> char '\\' *> (char '\\' <|> char '{' <|> char '}' <|> char '"' <|> ('\n' <$ char 'n'))
                 )
                 <|> partExprParser
           )
@@ -278,9 +344,11 @@ atomParser =
             (PartText . Text.pack)
             ( (++)
                 <$> some
-                  ( noneOf "\\$\"\n"
-                      <|> (char '\\' *> (char '\\' <|> char '$' <|> char '"' <|> ('\n' <$ char 'n')))
+                  ( noneOf "\\{}\"\n"
+                      <|> try (char '{' <* notFollowedBy (char '{'))
+                      <|> try (char '}' <* notFollowedBy (char '}'))
                       <|> try doubleQuote1
+                      <|> (char '\\' *> (char '\\' <|> char '{' <|> char '}' <|> char '"' <|> ('\n' <$ char 'n')))
                   )
                 <*> (fmap pure (char '\n' <* for_ mIndent (optional . indentParser)) <|> pure [])
             )
@@ -389,6 +457,25 @@ data TypeError
       !Kind
       -- | Actual
       !Kind
+  | ParentParseError
+      -- | Source offset of parent filepath
+      !Int
+      -- | File being parsed
+      !FilePath
+      Sage.ParseError
+  | NotRequirement
+      -- | Source offset of error
+      !Int
+      -- | Offending identifier
+      !Text
+  | BlockBadRequirementType
+      -- | Source offset of error
+      !Int
+      -- | Actual requirement type
+      !Type
+  | RequirementAlreadySatisfied
+      -- | Source offset of error
+      !Int
 
 data Type
   = TMeta !Int
@@ -415,7 +502,7 @@ data Type
   deriving (Show)
 
 newtype InferT m a = InferT (ReaderT InferEnv (StateT InferState (ExceptT TypeError m)) a)
-  deriving (Functor, Applicative, Monad, MonadReader InferEnv, MonadError TypeError)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadReader InferEnv, MonadError TypeError)
 
 runInferT :: Monad m => InferEnv -> InferState -> InferT m a -> m (Either TypeError (InferState, a))
 runInferT e s (InferT ma) = runExceptT . fmap Tuple.swap . flip runStateT s . flip runReaderT e $ ma
@@ -431,7 +518,7 @@ emptyInferEnv = InferEnv{ieScope = mempty}
 data InferState
   = InferState
   { isMetavars :: !(IntMap Metavar)
-  , isRequirements :: ![(Text, Type)]
+  , isRequirements :: ![Requirement]
   }
 
 data Metavar
@@ -440,22 +527,81 @@ data Metavar
   , metaSolution :: Maybe Type
   }
 
+data Requirement
+  = Requirement
+  { reqName :: !Text
+  , reqType :: !Type
+  , reqSatisfied :: !Bool
+  }
+
 data Kind = KType | KRow
   deriving (Show, Eq)
 
 emptyInferState :: InferState
 emptyInferState = InferState{isMetavars = mempty, isRequirements = mempty}
 
-getRequirements :: Monad m => InferT m [(Text, Type)]
+getRequirements :: Monad m => InferT m [Requirement]
 getRequirements = InferT $ gets isRequirements
 
-inferTemplate :: Monad m => Template -> InferT m ()
-inferTemplate (Template parts) = traverse_ inferPart parts
+checkTemplate :: MonadIO m => Template -> InferT m ()
+checkTemplate (TemplateBase _file parts) = traverse_ checkPart parts
+checkTemplate (TemplateChild file parent pragmas) = do
+  content <- liftIO . ByteString.readFile $ takeDirectory file </> locatedValue parent
+  template <-
+    case Sage.parse (templateParser file <* Sage.eof) content of
+      Left err -> throwError $ ParentParseError (locatedOffset parent) (locatedValue parent) err
+      Right x -> pure x
+  checkTemplate template
+  traverse_ checkPragma pragmas
 
-inferPart :: Monad m => Part -> InferT m ()
-inferPart PartText{} = pure ()
-inferPart (PartExpr e) = checkExpr e TString
-inferPart (PartExprStream e) = checkExpr e (TStream TString)
+checkPragma :: MonadIO m => Pragma -> InferT m ()
+checkPragma (PragmaBlock name parts) = do
+  mReq <- lookupRequirement $ locatedValue name
+  case mReq of
+    Nothing ->
+      throwError $ NotRequirement (locatedOffset name) (locatedValue name)
+    Just req -> do
+      if reqSatisfied req
+        then
+          throwError $ RequirementAlreadySatisfied (locatedOffset name)
+        else do
+          reqTy <- zonkDefault $ reqType req
+          case reqTy of
+            TString ->
+              satisfyRequirement $ locatedValue name
+            _ ->
+              throwError $ BlockBadRequirementType (locatedOffset name) reqTy
+  traverse_ checkPart parts
+checkPragma (PragmaWith vars) =
+  for_ vars $ \(name, value) -> do
+    mReq <- lookupRequirement $ locatedValue name
+    case mReq of
+      Nothing ->
+        throwError $ NotRequirement (locatedOffset name) (locatedValue name)
+      Just req ->
+        if reqSatisfied req
+          then
+            throwError $ RequirementAlreadySatisfied (locatedOffset name)
+          else do
+            checkExpr value $ reqType req
+            satisfyRequirement $ locatedValue name
+
+lookupRequirement :: Monad m => Text -> InferT m (Maybe Requirement)
+lookupRequirement name = InferT $ gets (find ((name ==) . reqName) . isRequirements)
+
+satisfyRequirement :: Monad m => Text -> InferT m ()
+satisfyRequirement name =
+  InferT . modify $ \s ->
+    s{isRequirements = modifyRequirement name (\r -> r{reqSatisfied = True}) $ isRequirements s}
+
+modifyRequirement :: Text -> (Requirement -> Requirement) -> [Requirement] -> [Requirement]
+modifyRequirement _name _f [] = []
+modifyRequirement name f (r : rs) = if reqName r == name then f r : rs else r : modifyRequirement name f rs
+
+checkPart :: Monad m => Part -> InferT m ()
+checkPart PartText{} = pure ()
+checkPart (PartExpr e) = checkExpr e TString
+checkPart (PartExprStream e) = checkExpr e (TStream TString)
 
 checkExpr ::
   Monad m =>
@@ -470,11 +616,11 @@ checkExpr (Located offset (Var v)) t = do
       Nothing -> require v
   unify offset t ty
 checkExpr (Located offset (String parts)) t = do
-  traverse_ inferPart parts
   unify offset t TString
+  traverse_ checkPart parts
 checkExpr (Located offset (MultilineString parts)) t = do
-  traverse_ inferPart parts
   unify offset t TString
+  traverse_ checkPart parts
 checkExpr (Located offset (Record fields)) t = do
   fieldsWithTys <- traverse (\(name, e) -> (,,) name e <$> metavar KType) fields
   let actual = TRecord $ foldr (\(name, _e, ty) -> TRecordField name ty) TRowEnd fieldsWithTys
@@ -533,15 +679,19 @@ checkPattern (Located offset (PConstructor name args)) t = do
 
 require :: Monad m => Text -> InferT m Type
 require name = do
-  mTy <- lookup name <$> getRequirements
-  case mTy of
+  mReq <- lookupRequirement name
+  case mReq of
     Nothing -> do
       ty <- metavar KType
       InferT $ do
-        modify $ \s -> s{isRequirements = isRequirements s ++ [(name, ty)]}
+        modify $ \s ->
+          s
+            { isRequirements =
+                isRequirements s ++ [Requirement{reqName = name, reqType = ty, reqSatisfied = False}]
+            }
       pure ty
-    Just ty ->
-      pure ty
+    Just req ->
+      pure $ reqType req
 
 metavar :: Monad m => Kind -> InferT m Type
 metavar kind = InferT $ do
@@ -914,11 +1064,25 @@ valueStream :: Value -> [Value]
 valueStream (VStream s) = s
 valueStream v = error $ "expected stream, got " ++ show v
 
-evalTemplate :: Map Text Value -> Template -> LazyByteString
-evalTemplate ctx (Template parts) =
-  foldMap
-    (evalPart ctx)
-    parts
+evalTemplate :: Map Text Value -> Template -> IO LazyByteString
+evalTemplate ctx (TemplateBase _file parts) = pure $ foldMap (evalPart ctx) parts
+evalTemplate ctx (TemplateChild file parent pragmas) = do
+  content <- ByteString.readFile $ takeDirectory file </> locatedValue parent
+  template <-
+    case Sage.parse (templateParser file <* Sage.eof) content of
+      Left err -> error $ show err
+      Right x -> pure x
+  let ctx' = Map.fromList $ concatMap (evalPragma ctx) pragmas
+  evalTemplate (ctx' <> ctx) template
+
+evalPragma :: Map Text Value -> Pragma -> [(Text, Value)]
+evalPragma ctx (PragmaBlock name parts) =
+  let
+    !value = VString $! foldMap (evalPart ctx) parts
+  in
+    [(locatedValue name, value)]
+evalPragma ctx (PragmaWith vars) =
+  [(locatedValue name, value) | (name, expr) <- vars, let !value = evalExpr ctx (locatedValue expr)]
 
 evalPart :: Map Text Value -> Part -> LazyByteString
 evalPart _ctx (PartText t) =

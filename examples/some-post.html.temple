@@ -1,0 +1,10 @@
+{% extends "post.html.temple" %}
+{%
+with
+  title = "My title",
+  date = "2026-07-03T03:30:00Z"
+%}
+{% block content %}
+<p>This is my article.</p>
+<p>The end.</p>
+{% end content %}

@@ -1,24 +1,20 @@
-<!doctype html>
-<html>
-<head>
-  <title>$(self.title)</title>
-</head>
-<body>
-<h1>$(self.title)</h1>
+{% extends "page.html.temple" %}
+{% block body %}
+<h1>{{title}}</h1>
 <article>
-$(self.body)
+<p>{{date}}</p>
+{{content}}
 </article>
 <p>
-$(
-  match self.previous
+{{
+  match previous
   | None -> "<span>Oldest</span>"
-  | Some(previous) -> """<a href="$(previous.url)">Previous: $(previous.title)</a>"""
-)
-$(
-  match self.next
+  | Some(previous) -> """<a href="{{previous.url}}">Previous: {{previous.title}}</a>"""
+}}
+{{
+  match next
   | None -> "<span>Newest</span>"
-  | Some(next) -> """<a href="$(next.url)">Next: $(next.title)</a>"""
-)
+  | Some(next) -> """<a href="{{next.url}}">Next: {{next.title}}</a>"""
+}}
 </p>
-</body>
-</html>
+{% end body %}

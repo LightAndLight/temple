@@ -1,13 +1,13 @@
 <!doctype html>
 <html>
 <head>
-  <title>$(title)</title>
+  <title>{{title}}</title>
 </head>
 <body>
 <ul>
-$$(
+{{*
   for item in items
-  yield """  <li><a href="$(item.url)">$(item.name)</a></li>\n"""
-)</ul>
+  yield """  <li><a href="{{item.url}}">{{item.name}}</a></li>\n"""
+}}</ul>
 </body>
 </html>

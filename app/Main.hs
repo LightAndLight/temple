@@ -3,26 +3,31 @@
 module Main (main) where
 
 import Control.Applicative (many, (<**>))
+import Control.Monad (guard)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Foldable (for_)
 import Data.List (find, intercalate)
 import qualified Data.Map as Map
+import Data.Maybe (mapMaybe)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import Data.Traversable (for)
 import qualified Options.Applicative as Options
+import System.Directory (makeAbsolute)
 import System.Exit (exitFailure)
 import Temple
   ( Expr
   , Kind (..)
   , Located (..)
+  , Requirement (..)
   , Template
   , Type (..)
   , TypeError (..)
   , checkExpr
+  , checkTemplate
   , emptyInferEnv
   , emptyInferState
   , evalExpr
@@ -30,7 +35,6 @@ import Temple
   , exprParser
   , getRequirements
   , identParser
-  , inferTemplate
   , runInferT
   , symbolic
   , templateParser
@@ -153,6 +157,27 @@ typeError (KindMismatch offset expected actual) =
           ++ ", got "
           ++ renderKind actual
     )
+typeError (ParentParseError offset _file _err) =
+  -- TODO: extend `diagnostica` to handle this sort of nesting
+  Diagnostic.emit
+    (Diagnostic.Offset offset)
+    Diagnostic.Caret
+    (fromString $ "file contains a parse error")
+typeError (NotRequirement offset _name) =
+  Diagnostic.emit
+    (Diagnostic.Offset offset)
+    Diagnostic.Caret
+    (fromString "block does not satisfy a known requirement")
+typeError (RequirementAlreadySatisfied offset) =
+  Diagnostic.emit
+    (Diagnostic.Offset offset)
+    Diagnostic.Caret
+    (fromString "requirement has previously been satisfied")
+typeError (BlockBadRequirementType offset actual) =
+  Diagnostic.emit
+    (Diagnostic.Offset offset)
+    Diagnostic.Caret
+    (fromString $ "requirement of type " ++ renderType actual ++ " cannot be satisfied by a block")
 
 renderFields :: [(Text, Type)] -> String
 renderFields [] = "none"
@@ -210,19 +235,28 @@ displayReport file report = do
 parseTemplate :: FilePath -> IO Template
 parseTemplate file = do
   input <- ByteString.readFile file
-  case Sage.parse templateParser input of
+  file' <- makeAbsolute file
+  case Sage.parse (templateParser file' <* Sage.eof) input of
     Left err -> do
       displayReport file $ Text.Diagnostic.Sage.parseError err
       exitFailure
     Right x -> pure x
 
-inferBindings :: FilePath -> Template -> IO [(Text.Text, Type)]
+inferBindings :: FilePath -> Template -> IO [(Text, Type)]
 inferBindings file template = do
   result <-
     runInferT emptyInferEnv emptyInferState $ do
-      inferTemplate template
-      bindings <- getRequirements
-      (traverse . traverse) zonkDefault bindings
+      checkTemplate template
+      requirements <- getRequirements
+      (traverse . traverse)
+        zonkDefault
+        ( mapMaybe
+            ( \req -> do
+                guard . not $ reqSatisfied req
+                pure (reqName req, reqType req)
+            )
+            requirements
+        )
 
   case result of
     Left err -> do
@@ -283,4 +317,4 @@ apply file args = do
       let !value = evalExpr mempty $ locatedValue expr
       pure (name, value)
 
-  LazyByteString.putStrLn $ evalTemplate (Map.fromList scope') template
+  LazyByteString.putStrLn =<< evalTemplate (Map.fromList scope') template
