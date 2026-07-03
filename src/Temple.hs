@@ -1,5 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Temple
   ( -- * Syntax
@@ -36,6 +38,7 @@ module Temple
   , getRequirements
   , InferEnv (..)
   , emptyInferEnv
+  , defaultScope
   , runInferT
   , checkTemplate
   , inferExpr
@@ -45,6 +48,7 @@ module Temple
   , zonkNoDefault
 
     -- * Evaluating
+  , defaultCtx
   , evalTemplate
   , evalPart
   , evalExpr
@@ -55,12 +59,15 @@ module Temple
   , valueString
   , valueRecord
   , valueStream
+
+    -- ** Builtins
+  , builtins
   )
 where
 
 import Control.Applicative (empty, many, optional, some, (<|>))
 import Control.Monad (guard, unless, when)
-import Control.Monad.Error.Class (MonadError, throwError)
+import Control.Monad.Error.Class (MonadError, catchError, throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (ReaderT, runReaderT)
@@ -70,6 +77,7 @@ import Control.Monad.State.Class (get, gets, modify, put)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
+import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import qualified Data.Char as Char
 import Data.Foldable (for_, traverse_)
 import Data.Functor (void)
@@ -93,11 +101,11 @@ import qualified Text.Sage as Sage
 
 data Template
   = TemplateBase
-      -- | Template path (absolute)
+      -- | Template path (relative to working directory)
       !FilePath
       [Part]
   | TemplateChild
-      -- | Template path (absolute)
+      -- | Template path (relative to working directory)
       !FilePath
       -- | Parent template
       !(Located FilePath)
@@ -120,12 +128,13 @@ data Located a
   { locatedOffset :: !Int
   , locatedValue :: !a
   }
-  deriving (Show, Eq)
+  deriving (Show, Eq, Functor)
 
 data Expr
   = Var !Text
   | String ![Part]
   | MultilineString ![Part]
+  | Call !(Located Text) ![Located Expr]
   | Record [(Text, Located Expr)]
   | Field !(Located Expr) !Field
   | Constructor !Text [Located Expr]
@@ -299,7 +308,9 @@ stringLiteralParser =
 atomParser :: Parser (Located Expr)
 atomParser =
   locatedParser
-    ( Var <$> identParser
+    ( (\name -> maybe (Var $ locatedValue name) (Call name))
+        <$> locatedParser identParser
+        <*> optional (parens $ commaSep exprParser)
         <|> (\name -> Constructor name . fromMaybe [])
           <$> ctorParser
           <*> optional (parens $ commaSep exprParser)
@@ -416,7 +427,10 @@ ctorParser =
     isCtorStart = Char.isUpper
 
 data TypeError
-  = TypeMismatch
+  = NotInScope
+      -- | Source offset of error
+      !Int
+  | TypeMismatch
       -- | Source offset of error
       !Int
       -- | Expected
@@ -457,12 +471,6 @@ data TypeError
       !Kind
       -- | Actual
       !Kind
-  | ParentParseError
-      -- | Source offset of parent filepath
-      !Int
-      -- | File being parsed
-      !FilePath
-      Sage.ParseError
   | NotRequirement
       -- | Source offset of error
       !Int
@@ -476,11 +484,24 @@ data TypeError
   | RequirementAlreadySatisfied
       -- | Source offset of error
       !Int
+  | ParentParseError
+      -- | Source offset of parent filepath
+      !Int
+      -- | File being parsed
+      !FilePath
+      Sage.ParseError
+  | ParentTypeError
+      -- | Source offset of error (in child)
+      !Int
+      -- | Path of parent file
+      !FilePath
+      TypeError
 
 data Type
   = TMeta !Int
   | TBool
   | TString
+  | TFn ![Type] Type
   | TStream !Type
   | TRecord !Type
   | TRecordField
@@ -515,6 +536,27 @@ data InferEnv
 emptyInferEnv :: InferEnv
 emptyInferEnv = InferEnv{ieScope = mempty}
 
+builtins :: Map Text (Value, Type)
+builtins =
+  let
+    strip =
+      ByteString.Lazy.Char8.dropWhileEnd Char.isSpace
+        . ByteString.Lazy.Char8.dropWhile Char.isSpace
+  in
+    Map.fromList
+      [
+        ( fromString "strip"
+        ,
+          ( VFn . Fn $ \case [s] -> VString . strip $ valueString s; _ -> undefined
+          , TFn [TString] TString
+          )
+        )
+      ]
+
+-- | @defaultScope = fmap snd 'builtins'@
+defaultScope :: Map Text Type
+defaultScope = fmap snd builtins
+
 data InferState
   = InferState
   { isMetavars :: !(IntMap Metavar)
@@ -546,12 +588,14 @@ getRequirements = InferT $ gets isRequirements
 checkTemplate :: MonadIO m => Template -> InferT m ()
 checkTemplate (TemplateBase _file parts) = traverse_ checkPart parts
 checkTemplate (TemplateChild file parent pragmas) = do
-  content <- liftIO . ByteString.readFile $ takeDirectory file </> locatedValue parent
-  template <-
+  let parentPath = takeDirectory file </> locatedValue parent
+  content <- liftIO $ ByteString.readFile parentPath
+  parentTemplate <-
     case Sage.parse (templateParser file <* Sage.eof) content of
-      Left err -> throwError $ ParentParseError (locatedOffset parent) (locatedValue parent) err
+      Left err -> throwError $ ParentParseError (locatedOffset parent) parentPath err
       Right x -> pure x
-  checkTemplate template
+  checkTemplate parentTemplate
+    `catchError` (throwError . ParentTypeError (locatedOffset parent) parentPath)
   traverse_ checkPragma pragmas
 
 checkPragma :: MonadIO m => Pragma -> InferT m ()
@@ -621,6 +665,16 @@ checkExpr (Located offset (String parts)) t = do
 checkExpr (Located offset (MultilineString parts)) t = do
   unify offset t TString
   traverse_ checkPart parts
+checkExpr (Located offset (Call name args)) t = do
+  argTys <- traverse (const $ metavar KType) args
+  mTy <- asks (Map.lookup (locatedValue name) . ieScope)
+  ty <-
+    case mTy of
+      Nothing -> throwError $ NotInScope (locatedOffset name)
+      Just ty -> pure ty
+  unify offset (TFn argTys t) ty
+  for_ (zip args argTys) $ \(arg, argTy) -> do
+    checkExpr arg argTy
 checkExpr (Located offset (Record fields)) t = do
   fieldsWithTys <- traverse (\(name, e) -> (,,) name e <$> metavar KType) fields
   let actual = TRecord $ foldr (\(name, _e, ty) -> TRecordField name ty) TRowEnd fieldsWithTys
@@ -728,6 +782,18 @@ unify offset TString ty =
     _ -> do
       ty' <- zonk False ty
       throwError $ TypeMismatch offset TString ty'
+unify offset (TFn args retTy) ty =
+  case ty of
+    TFn args' retTy' -> do
+      unless (length args == length args') . throwError $
+        ArityMismatch offset (length args) (length args')
+      traverse_ (uncurry $ unify offset) (zip args args')
+      unify offset retTy retTy'
+    _ -> do
+      args' <- traverse zonkNoDefault args
+      retTy' <- zonkNoDefault retTy
+      ty' <- zonkNoDefault ty
+      throwError $ TypeMismatch offset (TFn args' retTy') ty'
 unify offset (TStream a) ty =
   case ty of
     TStream a' -> unify offset a a'
@@ -847,6 +913,7 @@ kindOf (TMeta v) = do
     Just meta -> pure $ metaKind meta
 kindOf TBool = pure KType
 kindOf TString = pure KType
+kindOf TFn{} = pure KType
 kindOf TStream{} = pure KType
 kindOf TRecord{} = pure KType
 kindOf TRecordField{} = pure KRow
@@ -1031,6 +1098,7 @@ zonk def (TMeta v) = do
       maybe (pure defTy) (zonk def) (metaSolution meta)
 zonk _def TBool = pure TBool
 zonk _def TString = pure TString
+zonk def (TFn args retTy) = TFn <$> traverse (zonk def) args <*> zonk def retTy
 zonk def (TStream ty) = TStream <$> zonk def ty
 zonk def (TRecord fields) = TRecord <$> zonk def fields
 zonk def (TRecordField name ty rest) = TRecordField name <$> zonk def ty <*> zonk def rest
@@ -1042,10 +1110,16 @@ data Value
   = VTrue
   | VFalse
   | VString LazyByteString
+  | VFn Fn
   | VRecord !(Map Text Value)
   | VConstructor !Text ![Value]
   | VStream [Value]
   deriving (Show)
+
+newtype Fn = Fn ([Value] -> Value)
+
+instance Show Fn where
+  show _ = "<function>"
 
 valueBool :: Value -> Bool
 valueBool VTrue = True
@@ -1063,6 +1137,14 @@ valueRecord v = error $ "expected record, got " ++ show v
 valueStream :: Value -> [Value]
 valueStream (VStream s) = s
 valueStream v = error $ "expected stream, got " ++ show v
+
+valueFn :: Value -> [Value] -> Value
+valueFn (VFn (Fn f)) = f
+valueFn v = error $ "expected function, got " ++ show v
+
+-- | @defaultCtx = fmap fst 'builtins'@
+defaultCtx :: Map Text Value
+defaultCtx = fmap fst builtins
 
 evalTemplate :: Map Text Value -> Template -> IO LazyByteString
 evalTemplate ctx (TemplateBase _file parts) = pure $ foldMap (evalPart ctx) parts
@@ -1101,6 +1183,12 @@ evalExpr ctx (String parts) =
   VString $ foldMap (evalPart ctx) parts
 evalExpr ctx (MultilineString parts) =
   VString $ foldMap (evalPart ctx) parts
+evalExpr ctx (Call name args) =
+  let
+    !f = valueFn $ evalExpr ctx (Var $ locatedValue name)
+    !args' = fmap (evalExpr ctx . locatedValue) args
+  in
+    f args'
 evalExpr ctx (Record fields) =
   VRecord $! Map.fromList ((fmap . fmap) (evalExpr ctx . locatedValue) fields)
 evalExpr ctx (Field expr field) =
