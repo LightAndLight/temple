@@ -1,23 +1,44 @@
 {-# LANGUAGE BangPatterns #-}
+
 module Main (main) where
 
-import qualified Options.Applicative as Options
-import qualified Text.Sage as Sage
-import Temple (templateParser, TypeError(..), Type(..), runInferT, emptyInferEnv, emptyInferState, inferTemplate, getRequirements, zonkDefault, Kind(..), Expr, Template, checkExpr, Located(..), evalTemplate, evalExpr, identParser, symbolic, exprParser)
+import Control.Applicative (many, (<**>))
 import qualified Data.ByteString as ByteString
-import System.Exit (exitFailure)
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
-import qualified Text.Diagnostic as Diagnostic
-import Data.String (fromString)
-import qualified Text.Diagnostic.Sage
 import Data.Foldable (for_)
-import qualified Data.Text as Text
-import Data.List (intercalate, find)
-import qualified Data.Text.IO as Text
-import Control.Applicative ((<**>), many)
+import Data.List (find, intercalate)
 import qualified Data.Map as Map
-import Data.Traversable (for)
+import Data.String (fromString)
 import Data.Text (Text)
+import qualified Data.Text as Text
+import qualified Data.Text.IO as Text
+import Data.Traversable (for)
+import qualified Options.Applicative as Options
+import System.Exit (exitFailure)
+import Temple
+  ( Expr
+  , Kind (..)
+  , Located (..)
+  , Template
+  , Type (..)
+  , TypeError (..)
+  , checkExpr
+  , emptyInferEnv
+  , emptyInferState
+  , evalExpr
+  , evalTemplate
+  , exprParser
+  , getRequirements
+  , identParser
+  , inferTemplate
+  , runInferT
+  , symbolic
+  , templateParser
+  , zonkDefault
+  )
+import qualified Text.Diagnostic as Diagnostic
+import qualified Text.Diagnostic.Sage
+import qualified Text.Sage as Sage
 
 data Cli
   = Type !FilePath
@@ -34,24 +55,33 @@ data Argument
 
 argumentParser :: Sage.Parser Argument
 argumentParser =
-  Argument <$>
-  identParser <* symbolic '=' <*>
-  exprParser
+  Argument
+    <$> identParser
+    <* symbolic '='
+    <*> exprParser
 
 cliParser :: Options.Parser Cli
 cliParser =
   Options.hsubparser
-    (Options.command "type" (Options.info typeParser (Options.progDesc "Infer the type of a template"))
-      <> Options.command "apply" (Options.info applyParser (Options.progDesc "Apply a template to some arguments")))
+    ( Options.command "type" (Options.info typeParser (Options.progDesc "Infer the type of a template"))
+        <> Options.command
+          "apply"
+          (Options.info applyParser (Options.progDesc "Apply a template to some arguments"))
+    )
   where
     typeParser =
-      Type <$>
-        Options.strArgument (Options.metavar "FILE" <> Options.help "File to type")
+      Type
+        <$> Options.strArgument (Options.metavar "FILE" <> Options.help "File to type")
 
     applyParser =
-      Apply <$>
-        Options.strArgument (Options.metavar "FILE" <> Options.help "File to type") <*>
-        many (Options.strOption $ Options.long "arg" <> Options.metavar "NAME=VALUE" <> Options.help "Provide an argument to the template")
+      Apply
+        <$> Options.strArgument (Options.metavar "FILE" <> Options.help "File to type")
+        <*> many
+          ( Options.strOption $
+              Options.long "arg"
+                <> Options.metavar "NAME=VALUE"
+                <> Options.help "Provide an argument to the template"
+          )
 
 main :: IO ()
 main = do
@@ -65,63 +95,63 @@ typeError (TypeMismatch offset expected actual) =
   Diagnostic.emit
     (Diagnostic.Offset offset)
     Diagnostic.Caret
-    (fromString $
-      "expected " ++
-      renderType expected ++
-      ", got " ++
-      renderType actual
+    ( fromString $
+        "expected "
+          ++ renderType expected
+          ++ ", got "
+          ++ renderType actual
     )
 typeError (UnexpectedFields offset actual) =
   Diagnostic.emit
     (Diagnostic.Offset offset)
     Diagnostic.Caret
-    (fromString $
-      "record has unexpected fields " ++
-      renderFields actual
+    ( fromString $
+        "record has unexpected fields "
+          ++ renderFields actual
     )
 typeError (MissingFields offset expected) =
   Diagnostic.emit
     (Diagnostic.Offset offset)
     Diagnostic.Caret
-    (fromString $
-      "record is missing fields " ++
-      renderFields expected
+    ( fromString $
+        "record is missing fields "
+          ++ renderFields expected
     )
 typeError (UnexpectedConstructors offset actual) =
   Diagnostic.emit
     (Diagnostic.Offset offset)
     Diagnostic.Caret
-    (fromString $
-      "sum has unexpected constructors " ++
-      renderConstructors actual
+    ( fromString $
+        "sum has unexpected constructors "
+          ++ renderConstructors actual
     )
 typeError (MissingConstructors offset expected) =
   Diagnostic.emit
     (Diagnostic.Offset offset)
     Diagnostic.Caret
-    (fromString $
-      "sum is missing constructors " ++
-      renderConstructors expected
+    ( fromString $
+        "sum is missing constructors "
+          ++ renderConstructors expected
     )
 typeError (ArityMismatch offset expected actual) =
   Diagnostic.emit
     (Diagnostic.Offset offset)
     Diagnostic.Caret
-    (fromString $
-      "constructor requires " ++
-      show expected ++
-      " arguments, got " ++
-      show actual
+    ( fromString $
+        "constructor requires "
+          ++ show expected
+          ++ " arguments, got "
+          ++ show actual
     )
 typeError (KindMismatch offset expected actual) =
   Diagnostic.emit
     (Diagnostic.Offset offset)
     Diagnostic.Caret
-    (fromString $
-      "expected kind " ++
-      renderKind expected ++
-      ", got " ++
-      renderKind actual
+    ( fromString $
+        "expected kind "
+          ++ renderKind expected
+          ++ ", got "
+          ++ renderKind actual
     )
 
 renderFields :: [(Text, Type)] -> String
@@ -132,14 +162,14 @@ renderConstructors :: [(Text, [Type])] -> String
 renderConstructors [] = "none"
 renderConstructors xs =
   intercalate " | " $
-  fmap
-    (\(name, tys) ->
-      Text.unpack name ++
-      if null tys
-        then ""
-        else "(" ++ intercalate ", " (fmap renderType tys) ++ ")"
-    )
-    xs
+    fmap
+      ( \(name, tys) ->
+          Text.unpack name
+            ++ if null tys
+              then ""
+              else "(" ++ intercalate ", " (fmap renderType tys) ++ ")"
+      )
+      xs
 
 renderType :: Type -> String
 renderType (TMeta v) = "?" ++ show v
@@ -148,20 +178,22 @@ renderType TString = "String"
 renderType (TStream ty) = "Stream(" ++ renderType ty ++ ")"
 renderType (TRecord fields) = "Record(" ++ renderType fields ++ ")"
 renderType (TRecordField name ty rest) =
-  Text.unpack name ++ " : " ++ renderType ty ++
-  case rest of
-    TRowEnd -> ""
-    _ -> ", " ++ renderType rest
+  Text.unpack name
+    ++ " : "
+    ++ renderType ty
+    ++ case rest of
+      TRowEnd -> ""
+      _ -> ", " ++ renderType rest
 renderType (TSum ctors) = "Sum(" ++ renderType ctors ++ ")"
 renderType (TSumConstructor name tys rest) =
-  Text.unpack name ++
-  (if null tys
-    then ""
-    else "(" ++ intercalate ", " (fmap renderType tys) ++ ")"
-  ) ++
-  case rest of
-    TRowEnd -> ""
-    _ -> " | " ++ renderType rest
+  Text.unpack name
+    ++ ( if null tys
+           then ""
+           else "(" ++ intercalate ", " (fmap renderType tys) ++ ")"
+       )
+    ++ case rest of
+      TRowEnd -> ""
+      _ -> " | " ++ renderType rest
 renderType TRowEnd = ""
 
 renderKind :: Kind -> String
@@ -171,9 +203,9 @@ renderKind KRow = "Row"
 displayReport :: FilePath -> Diagnostic.Report -> IO ()
 displayReport file report = do
   content <- LazyByteString.readFile file
-  LazyByteString.putStrLn .
-    Diagnostic.render Diagnostic.defaultConfig (fromString file) content $
-    report
+  LazyByteString.putStrLn
+    . Diagnostic.render Diagnostic.defaultConfig (fromString file) content
+    $ report
 
 parseTemplate :: FilePath -> IO Template
 parseTemplate file = do
@@ -211,18 +243,18 @@ apply :: FilePath -> [String] -> IO ()
 apply file args = do
   template <- parseTemplate file
 
-  args' <- for (zip [0::Int ..] args) $ \(index, arg) -> do
+  args' <- for (zip [0 :: Int ..] args) $ \(index, arg) -> do
     case Sage.parse (argumentParser <* Sage.eof) (fromString arg) of
       Left err -> do
-        LazyByteString.putStrLn .
-          Diagnostic.render
+        LazyByteString.putStrLn
+          . Diagnostic.render
             Diagnostic.defaultConfig
             (fromString $ "(argument " ++ show index ++ ")")
-            (fromString arg) $
-          Text.Diagnostic.Sage.parseError err
+            (fromString arg)
+          $ Text.Diagnostic.Sage.parseError err
         exitFailure
       Right arg' -> pure (index, arg, arg')
-  
+
   bindings <- inferBindings file template
 
   scope <-
@@ -238,11 +270,12 @@ apply file args = do
             Right (_state, ()) ->
               pure (name, argValue arg)
             Left err -> do
-              LazyByteString.putStrLn .
-                Diagnostic.render Diagnostic.defaultConfig
+              LazyByteString.putStrLn
+                . Diagnostic.render
+                  Diagnostic.defaultConfig
                   (fromString $ "(argument " ++ show index ++ ")")
-                  (fromString argPlain) $
-                typeError err
+                  (fromString argPlain)
+                $ typeError err
               exitFailure
 
   scope' <-

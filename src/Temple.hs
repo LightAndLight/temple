@@ -163,15 +163,17 @@ partParser :: Parser Part
 partParser =
   PartText . Text.pack
     <$> some
-      ( noneOf "{}"
-          <|> try ((char '{' *> char '{') <?> "escaped open brace")
-          <|> try ((char '}' *> char '}') <?> "escaped close brace")
+      ( noneOf "\\$"
+          <|> (char '\\' *> (char '\\' <|> char '$'))
       )
-    <|> ($)
-      <$ char '{'
-      <*> token (PartExprStream <$ char '*' <|> pure PartExpr)
-      <*> exprParser
-      <* char '}'
+    <|> partExprParser
+
+partExprParser :: Parser Part
+partExprParser =
+  ($)
+    <$ char '$'
+    <*> token (PartExprStream <$ char '$' <|> pure PartExpr)
+    <*> between (symbolic '(') (char ')') exprParser
 
 kIf, kThen, kElse, kFor, kIn, kYield, kMatch, kRecord :: Text
 kIf = fromString "if"
@@ -209,17 +211,38 @@ exprParser =
     <|> locatedParser ifThenElseParser
     <|> locatedParser forParser
   where
-    atomParser =
-      locatedParser
-        ( Var <$> identParser
-            <|> (\name -> Constructor name . fromMaybe []) <$>
-              ctorParser <*>
-              optional (parens $ commaSep exprParser)
-            <|> String <$> stringParser
-            <|> MultilineString <$> multilineStringParser
-        )
-        <|> parens exprParser
+    recordParser =
+      Record
+        <$ symbol kRecord
+        <*> parens (commaSep $ (,) <$> identParser <* symbolic '=' <*> exprParser)
 
+    matchParser =
+      Match <$ symbol kMatch <*> exprParser <*> many branchParser
+
+    ifThenElseParser =
+      IfThenElse
+        <$ symbol kIf
+        <*> exprParser
+        <* symbol kThen
+        <*> exprParser
+        <* symbol kElse
+        <*> exprParser
+
+    forParser =
+      For <$ symbol kFor <*> identParser <* symbol kIn <*> exprParser <* symbol kYield <*> exprParser
+
+atomParser :: Parser (Located Expr)
+atomParser =
+  locatedParser
+    ( Var <$> identParser
+        <|> (\name -> Constructor name . fromMaybe [])
+          <$> ctorParser
+          <*> optional (parens $ commaSep exprParser)
+        <|> String <$> stringParser
+        <|> MultilineString <$> multilineStringParser
+    )
+    <|> parens exprParser
+  where
     doubleQuote1 = char '"' <* notFollowedBy (string $ fromString "\"\"")
 
     stringParser =
@@ -231,13 +254,10 @@ exprParser =
               fmap
                 (PartText . Text.pack)
                 ( some $
-                    noneOf "{}\"\n"
-                      <|> try (char '{' *> char '{')
-                      <|> try (char '}' *> char '}')
-                      <|> try (char '\\' *> char '\\')
-                      <|> try (char '\\' *> char '"')
+                    noneOf "\\$\"\n"
+                      <|> char '\\' *> (char '\\' <|> char '$' <|> char '"' <|> ('\n' <$ char 'n'))
                 )
-                <|> PartExpr <$> between (symbolic '{') (char '}') exprParser
+                <|> partExprParser
           )
 
     doubleQuote3 = string $ fromString "\"\"\""
@@ -256,14 +276,13 @@ exprParser =
             (PartText . Text.pack)
             ( (++)
                 <$> some
-                  ( noneOf "{}\"\n"
-                      <|> try (char '{' *> char '{')
-                      <|> try (char '}' *> char '}')
+                  ( noneOf "\\$\"\n"
+                      <|> (char '\\' *> (char '\\' <|> char '$' <|> char '"' <|> ('\n' <$ char 'n')))
                       <|> try doubleQuote1
                   )
                 <*> (fmap pure (char '\n' <* for_ mIndent (optional . indentParser)) <|> pure [])
             )
-            <|> PartExpr <$> between (symbolic '{') (char '}') exprParser
+            <|> partExprParser
         )
 
     indentParser total = go total <?> ("indentation (" ++ show total ++ " spaces)")
@@ -288,26 +307,6 @@ exprParser =
         Just{} ->
           (:) (PartText $ fromString "\n")
             <$> multilineLinesParser
-
-    recordParser =
-      Record
-        <$ symbol kRecord
-        <*> parens (commaSep $ (,) <$> identParser <* symbolic '=' <*> exprParser)
-
-    matchParser =
-      Match <$ symbol kMatch <*> exprParser <*> many branchParser
-
-    ifThenElseParser =
-      IfThenElse
-        <$ symbol kIf
-        <*> exprParser
-        <* symbol kThen
-        <*> exprParser
-        <* symbol kElse
-        <*> exprParser
-
-    forParser =
-      For <$ symbol kFor <*> identParser <* symbol kIn <*> exprParser <* symbol kYield <*> exprParser
 
 fieldParser :: Parser Field
 fieldParser =

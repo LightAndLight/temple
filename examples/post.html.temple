@@ -1,24 +1,24 @@
 <!doctype html>
 <html>
 <head>
-  <title>{self.title}</title>
+  <title>$(self.title)</title>
 </head>
 <body>
-<h1>{self.title}</h1>
+<h1>$(self.title)</h1>
 <article>
-{self.body}
+$(self.body)
 </article>
 <p>
-{
+$(
   match self.previous
   | None -> "<span>Oldest</span>"
-  | Some(previous) -> """<a href="{previous.url}">Previous: {previous.title}</a>"""
-}
-{
+  | Some(previous) -> """<a href="$(previous.url)">Previous: $(previous.title)</a>"""
+)
+$(
   match self.next
   | None -> "<span>Newest</span>"
-  | Some(next) -> """<a href="{next.url}">Next: {next.title}</a>"""
-}
+  | Some(next) -> """<a href="$(next.url)">Next: $(next.title)</a>"""
+)
 </p>
 </body>
 </html>
