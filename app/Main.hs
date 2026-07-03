@@ -176,7 +176,7 @@ renderType (TMeta v) = "?" ++ show v
 renderType TBool = "Bool"
 renderType TString = "String"
 renderType (TStream ty) = "Stream(" ++ renderType ty ++ ")"
-renderType (TRecord fields) = "Record(" ++ renderType fields ++ ")"
+renderType (TRecord fields) = "{" ++ renderType fields ++ "}"
 renderType (TRecordField name ty rest) =
   Text.unpack name
     ++ " : "

@@ -111,6 +111,7 @@ data Expr
   | Constructor !Text [Located Expr]
   | Match !(Located Expr) ![Branch]
   | IfThenElse !(Located Expr) !(Located Expr) !(Located Expr)
+  | Array ![Located Expr]
   | -- | @for <name> in <collection> yield <value>@
     For
       -- | @<name>@
@@ -175,7 +176,7 @@ partExprParser =
     <*> token (PartExprStream <$ char '$' <|> pure PartExpr)
     <*> between (symbolic '(') (char ')') exprParser
 
-kIf, kThen, kElse, kFor, kIn, kYield, kMatch, kRecord :: Text
+kIf, kThen, kElse, kFor, kIn, kYield, kMatch :: Text
 kIf = fromString "if"
 kThen = fromString "then"
 kElse = fromString "else"
@@ -183,7 +184,6 @@ kFor = fromString "for"
 kIn = fromString "in"
 kYield = fromString "yield"
 kMatch = fromString "match"
-kRecord = fromString "record"
 
 keywords :: [Text]
 keywords =
@@ -194,7 +194,6 @@ keywords =
   , kIn
   , kYield
   , kMatch
-  , kRecord
   ]
 
 locatedParser :: Parser a -> Parser (Located a)
@@ -212,9 +211,11 @@ exprParser =
     <|> locatedParser forParser
   where
     recordParser =
-      Record
-        <$ symbol kRecord
-        <*> parens (commaSep $ (,) <$> identParser <* symbolic '=' <*> exprParser)
+      Record <$>
+        between
+          (symbolic '{')
+          (symbolic '}')
+          (commaSep $ (,) <$> identParser <* symbolic '=' <*> exprParser)
 
     matchParser =
       Match <$ symbol kMatch <*> exprParser <*> many branchParser
@@ -240,6 +241,7 @@ atomParser =
           <*> optional (parens $ commaSep exprParser)
         <|> String <$> stringParser
         <|> MultilineString <$> multilineStringParser
+        <|> Array <$> between (symbolic '[') (symbolic ']') (commaSep exprParser)
     )
     <|> parens exprParser
   where
@@ -500,6 +502,11 @@ checkExpr (Located _offset (IfThenElse cond th el)) t = do
   checkExpr cond TBool
   checkExpr th t
   checkExpr el t
+checkExpr (Located offset (Array items)) t = do
+  valueTy <- metavar KType
+  unify offset t (TStream valueTy)
+  for_ items $ \item -> do
+    checkExpr item valueTy
 checkExpr (Located offset (For name items value)) t = do
   valueTy <- metavar KType
   unify offset t (TStream valueTy)
@@ -981,6 +988,8 @@ evalExpr ctx (IfThenElse cond t e) =
   if valueBool $ evalExpr ctx (locatedValue cond)
     then evalExpr ctx (locatedValue t)
     else evalExpr ctx (locatedValue e)
+evalExpr ctx (Array items) =
+  VStream [evalExpr ctx (locatedValue item) | item <- items]
 evalExpr ctx (For name xs yield) =
   let
     xs' = valueStream $ evalExpr ctx (locatedValue xs)
