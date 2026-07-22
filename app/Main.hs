@@ -28,11 +28,14 @@ import Temple
   , Type (..)
   , TypeError (..)
   , checkExpr
+  , defaultEvalEnv
+  , EvalEnv(..)
   , checkTemplate
   , defaultCtx
   , defaultScope
   , emptyInferEnv
   , emptyInferState
+  , InferState(..)
   , evalExpr
   , evalTemplate
   , exprParser
@@ -46,6 +49,7 @@ import Temple
 import qualified Text.Diagnostic as Diagnostic
 import qualified Text.Diagnostic.Sage
 import qualified Text.Sage as Sage
+import Data.Map (Map)
 
 data Cli
   = Type !FilePath
@@ -220,6 +224,26 @@ typeError (ParentTypeError offset file err) =
     )
     file
     (typeError err)
+typeError (IncludeParseError offset file err) =
+  -- TODO: extend `diagnostica` to handle this sort of nesting?
+  MultiReport
+    ( Diagnostic.emit
+        (Diagnostic.Offset offset)
+        Diagnostic.Caret
+        (fromString $ "parse error in included template")
+    )
+    file
+    (SingleReport $ Text.Diagnostic.Sage.parseError err)
+typeError (IncludeTypeError offset file err) =
+  -- TODO: extend `diagnostica` to handle this sort of nesting?
+  MultiReport
+    ( Diagnostic.emit
+        (Diagnostic.Offset offset)
+        Diagnostic.Caret
+        (fromString $ "type error in included template")
+    )
+    file
+    (typeError err)
 
 renderFields :: [(Text, Type)] -> String
 renderFields [] = "none"
@@ -290,13 +314,13 @@ parseTemplate file = do
       exitFailure
     Right x -> pure x
 
-defaultInferEnv :: InferEnv
-defaultInferEnv = emptyInferEnv{ieScope = defaultScope}
+defaultInferEnv :: FilePath -> InferEnv
+defaultInferEnv currentFile = (emptyInferEnv currentFile){ieScope = defaultScope}
 
-inferBindings :: FilePath -> Template -> IO [(Text, Type)]
+inferBindings :: FilePath -> Template -> IO (Map FilePath Template, [(Text, Type)])
 inferBindings file template = do
   result <-
-    runInferT defaultInferEnv emptyInferState $ do
+    runInferT (defaultInferEnv file) emptyInferState $ do
       checkTemplate template
       requirements <- getRequirements
       (traverse . traverse)
@@ -313,12 +337,12 @@ inferBindings file template = do
     Left err -> do
       displayMultiReport file LazyByteString.readFile $ typeError err
       exitFailure
-    Right (_state, bindings) -> pure bindings
+    Right (state, bindings) -> pure (isDependencies state, bindings)
 
 type_ :: FilePath -> IO ()
 type_ file = do
   template <- parseTemplate file
-  bindings <- inferBindings file template
+  (_deps, bindings) <- inferBindings file template
   for_ bindings $ \(binding, ty) -> do
     Text.putStr binding
     putStr " : "
@@ -340,7 +364,7 @@ apply file args = do
         exitFailure
       Right arg' -> pure (index, arg, arg')
 
-  bindings <- inferBindings file template
+  (deps, bindings) <- inferBindings file template
 
   scope <-
     for bindings $ \(name, ty) -> do
@@ -349,7 +373,7 @@ apply file args = do
           putStrLn $ "error: argument " ++ Text.unpack name ++ " not provided"
           exitFailure
         Just (index, argPlain, arg) -> do
-          result <- runInferT emptyInferEnv emptyInferState $ checkExpr (argValue arg) ty
+          result <- runInferT (emptyInferEnv ".") emptyInferState $ checkExpr (argValue arg) ty
 
           case result of
             Right (_state, ()) ->
@@ -363,7 +387,8 @@ apply file args = do
 
   scope' <-
     for scope $ \(name, expr) -> do
-      let !value = evalExpr defaultCtx $ locatedValue expr
+      let !value = evalExpr (defaultEvalEnv "." mempty) $ locatedValue expr
       pure (name, value)
 
-  LazyByteString.putStrLn =<< evalTemplate (Map.fromList scope' <> defaultCtx) template
+  LazyByteString.putStrLn $
+    evalTemplate (defaultEvalEnv file deps){eeScope = Map.fromList scope' <> defaultCtx} template

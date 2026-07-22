@@ -48,10 +48,12 @@ module Temple
   , zonkNoDefault
 
     -- * Evaluating
-  , defaultCtx
   , evalTemplate
   , evalPart
   , evalExpr
+  , EvalEnv(..)
+  , defaultEvalEnv
+  , defaultCtx
 
     -- ** Values
   , Value (..)
@@ -121,6 +123,9 @@ data Part
   = PartText !Text
   | PartExpr !(Located Expr)
   | PartExprStream !(Located Expr)
+  | PartInclude
+      -- | File to include
+      !(Located Text)
   deriving (Show, Eq)
 
 data Located a
@@ -170,10 +175,9 @@ templateParser path =
     <|> TemplateBase path <$> many partParser
   where
     pragmaExtendsParser =
-      between
-        openPragmaParser
-        (token closePragmaParser)
-        (symbol (fromString "extends") *> locatedParser stringLiteralParser)
+      try (openPragmaParser *> symbol (fromString "extends")) *>
+        locatedParser stringLiteralParser  <*
+        token closePragmaParser
 
 openPragmaParser :: Parser ()
 openPragmaParser = void . symbol $ fromString "{%"
@@ -227,6 +231,7 @@ partParser =
           <|> (char '\\' *> (char '\\' <|> char '{' <|> char '}'))
       )
     <|> partExprParser
+    <|> partIncludeParser
 
 partExprParser :: Parser Part
 partExprParser =
@@ -235,6 +240,13 @@ partExprParser =
     <*> token (PartExprStream <$ symbolic '*' <|> pure PartExpr)
     <*> exprParser
     <* string (fromString "}}")
+
+partIncludeParser :: Parser Part
+partIncludeParser =
+  PartInclude <$
+    try (openPragmaParser <* notFollowedBy (symbol $ fromString "end")) <* symbol (fromString "include") <*>
+    locatedParser (fmap Text.pack stringLiteralParser) <*
+    closePragmaParser
 
 kIf, kThen, kElse, kFor, kIn, kYield, kMatch :: Text
 kIf = fromString "if"
@@ -337,6 +349,7 @@ atomParser =
                       <|> char '\\' *> (char '\\' <|> char '{' <|> char '}' <|> char '"' <|> ('\n' <$ char 'n'))
                 )
                 <|> partExprParser
+                <|> partIncludeParser
           )
 
     doubleQuote3 = string $ fromString "\"\"\""
@@ -364,6 +377,7 @@ atomParser =
                 <*> (fmap pure (char '\n' <* for_ mIndent (optional . indentParser)) <|> pure [])
             )
             <|> partExprParser
+            <|> partIncludeParser
         )
 
     indentParser total = go total <?> ("indentation (" ++ show total ++ " spaces)")
@@ -496,6 +510,18 @@ data TypeError
       -- | Path of parent file
       !FilePath
       TypeError
+  | IncludeParseError
+      -- | Source offset of include filepath
+      !Int
+      -- | File being parsed
+      !FilePath
+      Sage.ParseError
+  | IncludeTypeError
+      -- | Source offset of include filepath
+      !Int
+      -- | File being type checked
+      !FilePath
+      TypeError
 
 data Type
   = TMeta !Int
@@ -530,11 +556,15 @@ runInferT e s (InferT ma) = runExceptT . fmap Tuple.swap . flip runStateT s . fl
 
 data InferEnv
   = InferEnv
-  { ieScope :: !(Map Text Type)
+  { ieCurrentFile :: !FilePath
+  , ieScope :: !(Map Text Type)
   }
 
-emptyInferEnv :: InferEnv
-emptyInferEnv = InferEnv{ieScope = mempty}
+emptyInferEnv ::
+  -- | Current file
+  FilePath ->
+  InferEnv
+emptyInferEnv currentFile = InferEnv{ieCurrentFile = currentFile, ieScope = mempty}
 
 builtins :: Map Text (Value, Type)
 builtins =
@@ -561,6 +591,7 @@ data InferState
   = InferState
   { isMetavars :: !(IntMap Metavar)
   , isRequirements :: ![Requirement]
+  , isDependencies :: !(Map FilePath Template)
   }
 
 data Metavar
@@ -580,10 +611,13 @@ data Kind = KType | KRow
   deriving (Show, Eq)
 
 emptyInferState :: InferState
-emptyInferState = InferState{isMetavars = mempty, isRequirements = mempty}
+emptyInferState = InferState{isMetavars = mempty, isRequirements = mempty, isDependencies = mempty}
 
 getRequirements :: Monad m => InferT m [Requirement]
 getRequirements = InferT $ gets isRequirements
+
+addDependency :: Monad m => FilePath -> Template -> InferT m ()
+addDependency path template = InferT $ modify $ \s -> s{isDependencies = Map.insert path template $ isDependencies s}
 
 checkTemplate :: MonadIO m => Template -> InferT m ()
 checkTemplate (TemplateBase _file parts) = traverse_ checkPart parts
@@ -594,9 +628,11 @@ checkTemplate (TemplateChild file parent pragmas) = do
     case Sage.parse (templateParser file <* Sage.eof) content of
       Left err -> throwError $ ParentParseError (locatedOffset parent) parentPath err
       Right x -> pure x
-  checkTemplate parentTemplate
-    `catchError` (throwError . ParentTypeError (locatedOffset parent) parentPath)
+  local (\env -> env{ieCurrentFile = parentPath}) $
+    checkTemplate parentTemplate
+      `catchError` (throwError . ParentTypeError (locatedOffset parent) parentPath)
   traverse_ checkPragma pragmas
+  addDependency parentPath parentTemplate
 
 checkPragma :: MonadIO m => Pragma -> InferT m ()
 checkPragma (PragmaBlock name parts) = do
@@ -642,13 +678,26 @@ modifyRequirement :: Text -> (Requirement -> Requirement) -> [Requirement] -> [R
 modifyRequirement _name _f [] = []
 modifyRequirement name f (r : rs) = if reqName r == name then f r : rs else r : modifyRequirement name f rs
 
-checkPart :: Monad m => Part -> InferT m ()
+checkPart :: MonadIO m => Part -> InferT m ()
 checkPart PartText{} = pure ()
 checkPart (PartExpr e) = checkExpr e TString
 checkPart (PartExprStream e) = checkExpr e (TStream TString)
+checkPart (PartInclude target) = do
+  currentFile <- asks ieCurrentFile
+
+  let includePath = takeDirectory currentFile </> Text.unpack (locatedValue target)
+  content <- liftIO $ ByteString.readFile includePath
+  includeTemplate <-
+    case Sage.parse (templateParser currentFile <* Sage.eof) content of
+      Left err -> throwError $ IncludeParseError (locatedOffset target) includePath err
+      Right x -> pure x
+  local (\env -> env{ieCurrentFile = includePath}) $
+    checkTemplate includeTemplate
+      `catchError` (throwError . IncludeTypeError (locatedOffset target) includePath )
+  addDependency includePath includeTemplate
 
 checkExpr ::
-  Monad m =>
+  MonadIO m =>
   Located Expr ->
   Type ->
   InferT m ()
@@ -715,7 +764,7 @@ checkExpr (Located offset (For name items value)) t = do
   local (\env -> env{ieScope = Map.insert name itemTy $ ieScope env}) $
     checkExpr value valueTy
 
-inferExpr :: Monad m => Located Expr -> InferT m Type
+inferExpr :: MonadIO m => Located Expr -> InferT m Type
 inferExpr e = do
   t <- metavar KType
   t <$ checkExpr e t
@@ -1142,61 +1191,86 @@ valueFn :: Value -> [Value] -> Value
 valueFn (VFn (Fn f)) = f
 valueFn v = error $ "expected function, got " ++ show v
 
+data EvalEnv
+  = EvalEnv
+  { eeCurrentFile :: !FilePath
+  , eeDependencies :: !(Map FilePath Template)
+  , eeScope :: !(Map Text Value)
+  }
+
+defaultEvalEnv ::
+  FilePath ->
+  Map FilePath Template ->
+  EvalEnv
+defaultEvalEnv currentFile dependencies =
+  EvalEnv
+  { eeCurrentFile = currentFile
+  , eeDependencies = dependencies
+  , eeScope = defaultCtx
+  }
+
 -- | @defaultCtx = fmap fst 'builtins'@
 defaultCtx :: Map Text Value
 defaultCtx = fmap fst builtins
 
-evalTemplate :: Map Text Value -> Template -> IO LazyByteString
-evalTemplate ctx (TemplateBase _file parts) = pure $ foldMap (evalPart ctx) parts
-evalTemplate ctx (TemplateChild file parent pragmas) = do
-  content <- ByteString.readFile $ takeDirectory file </> locatedValue parent
-  template <-
-    case Sage.parse (templateParser file <* Sage.eof) content of
-      Left err -> error $ show err
-      Right x -> pure x
-  let ctx' = Map.fromList $ concatMap (evalPragma ctx) pragmas
-  evalTemplate (ctx' <> ctx) template
-
-evalPragma :: Map Text Value -> Pragma -> [(Text, Value)]
-evalPragma ctx (PragmaBlock name parts) =
+evalTemplate :: EvalEnv -> Template -> LazyByteString
+evalTemplate env (TemplateBase _file parts) =
+  foldMap (evalPart env) parts
+evalTemplate env (TemplateChild file parent pragmas) =
   let
-    !value = VString $! foldMap (evalPart ctx) parts
+    parentPath = takeDirectory file </> locatedValue parent
+    template =
+      fromMaybe (error $ "missing dependency: " ++ parentPath) $
+      Map.lookup parentPath (eeDependencies env)
+    !ctx' = Map.fromList $ foldMap (evalPragma env) pragmas
+  in
+    evalTemplate env{eeScope = ctx' <> eeScope env} template
+
+evalPragma :: EvalEnv -> Pragma -> [(Text, Value)]
+evalPragma env (PragmaBlock name parts) =
+  let
+    !value = VString $! foldMap (evalPart env) parts
   in
     [(locatedValue name, value)]
-evalPragma ctx (PragmaWith vars) =
-  [(locatedValue name, value) | (name, expr) <- vars, let !value = evalExpr ctx (locatedValue expr)]
+evalPragma env (PragmaWith vars) =
+  [(locatedValue name, value) | (name, expr) <- vars, let !value = evalExpr env (locatedValue expr)]
 
-evalPart :: Map Text Value -> Part -> LazyByteString
-evalPart _ctx (PartText t) =
+evalPart :: EvalEnv -> Part -> LazyByteString
+evalPart _env (PartText t) =
   Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict t
-evalPart ctx (PartExpr e) =
-  valueString $ evalExpr ctx (locatedValue e)
-evalPart ctx (PartExprStream e) =
-  foldMap valueString . valueStream $ evalExpr ctx (locatedValue e)
+evalPart env (PartExpr e) =
+  valueString $ evalExpr env (locatedValue e)
+evalPart env (PartExprStream e) =
+  foldMap valueString . valueStream $ evalExpr env (locatedValue e)
+evalPart env (PartInclude file) =
+  let
+    includePath = takeDirectory (eeCurrentFile env) </> Text.unpack (locatedValue file)
+    template =
+      fromMaybe (error $ "missing dependency: " ++ includePath) $
+      Map.lookup includePath $ eeDependencies env
+  in
+    evalTemplate env{eeCurrentFile = includePath} template
 
-evalExpr :: Map Text Value -> Expr -> Value
-evalExpr ctx (Var v) =
-  case Map.lookup v ctx of
+evalExpr :: EvalEnv -> Expr -> Value
+evalExpr env (Var v) =
+  case Map.lookup v $ eeScope env of
     Nothing -> error $ "not in scope: " ++ Text.unpack v
     Just value -> value
-evalExpr ctx (String parts) =
-  VString $ foldMap (evalPart ctx) parts
-evalExpr ctx (MultilineString parts) =
-  VString $ foldMap (evalPart ctx) parts
-evalExpr ctx (Call name args) =
+evalExpr env (String parts) =
+  VString $! foldMap (evalPart env) parts
+evalExpr env (MultilineString parts) =
+  VString $! foldMap (evalPart env) parts
+evalExpr env (Call name args) =
   let
-    !f = valueFn $ evalExpr ctx (Var $ locatedValue name)
-    !args' = fmap (evalExpr ctx . locatedValue) args
+    !f = valueFn $ evalExpr env (Var $ locatedValue name)
+    !args' = fmap (evalExpr env . locatedValue) args
   in
     f args'
-evalExpr ctx (Record fields) =
-  VRecord $! Map.fromList ((fmap . fmap) (evalExpr ctx . locatedValue) fields)
-evalExpr ctx (Field expr field) =
+evalExpr env (Record fields) =
+  VRecord $! Map.fromList ((fmap . fmap) (evalExpr env . locatedValue) fields)
+evalExpr env (Field expr field) =
   let
-    record :: Map Text Value
-    record = valueRecord $ evalExpr ctx (locatedValue expr)
-
-    field' :: Text
+    record = valueRecord $ evalExpr env (locatedValue expr)
     field' =
       case field of
         FStatic f ->
@@ -1205,7 +1279,7 @@ evalExpr ctx (Field expr field) =
           Text.Encoding.decodeUtf8
             . LazyByteString.toStrict
             . valueString
-            $ evalExpr ctx (locatedValue e)
+            $ evalExpr env (locatedValue e)
   in
     case Map.lookup field' record of
       Nothing ->
@@ -1217,14 +1291,14 @@ evalExpr ctx (Field expr field) =
             ++ "}"
       Just value ->
         value
-evalExpr ctx (Constructor name args) =
+evalExpr env (Constructor name args) =
   let
-    !args' = fmap (evalExpr ctx . locatedValue) args
+    !args' = fmap (evalExpr env . locatedValue) args
   in
     VConstructor name args'
-evalExpr ctx (Match e bs) =
+evalExpr env (Match e bs) =
   let
-    v = evalExpr ctx (locatedValue e)
+    v = evalExpr env (locatedValue e)
     (bindings, body) =
       foldr
         ( \(Branch pattern body') rest ->
@@ -1235,18 +1309,18 @@ evalExpr ctx (Match e bs) =
         (error "pattern match failure")
         bs
   in
-    evalExpr (bindings <> ctx) (locatedValue body)
-evalExpr ctx (IfThenElse cond t e) =
-  if valueBool $ evalExpr ctx (locatedValue cond)
-    then evalExpr ctx (locatedValue t)
-    else evalExpr ctx (locatedValue e)
-evalExpr ctx (Array items) =
-  VStream [evalExpr ctx (locatedValue item) | item <- items]
-evalExpr ctx (For name xs yield) =
+    evalExpr env{eeScope = bindings <> eeScope env} (locatedValue body)
+evalExpr env (IfThenElse cond t e) =
+  if valueBool $ evalExpr env (locatedValue cond)
+    then evalExpr env (locatedValue t)
+    else evalExpr env (locatedValue e)
+evalExpr env (Array items) =
+  VStream [evalExpr env (locatedValue item) | item <- items]
+evalExpr env (For name xs yield) =
   let
-    xs' = valueStream $ evalExpr ctx (locatedValue xs)
+    xs' = valueStream $ evalExpr env(locatedValue xs)
   in
-    VStream [evalExpr (Map.insert name x' ctx) (locatedValue yield) | x' <- xs']
+    VStream [evalExpr env{eeScope = Map.insert name x' $ eeScope env} (locatedValue yield) | x' <- xs']
 
 match :: Pattern -> Value -> Maybe (Map Text Value)
 match (PConstructor name args) v =
