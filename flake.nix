@@ -10,9 +10,19 @@
     };
   };
   outputs = { self, nixpkgs, flake-utils, hdeps }:
+    {
+      overlays.hdeps = import ./nix/generated/overlay.nix;
+    } //
     flake-utils.lib.eachDefaultSystem (system:
       let 
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [
+            (final: prev: {
+              haskellPackages = prev.haskellPackages.extend (import ./nix/generated/overlay.nix);
+            })
+          ];
+        };
       in {
         devShell = pkgs.mkShell {
           buildInputs = with pkgs; [
@@ -29,6 +39,8 @@
             cabal2nix
           ];
         };
+
+        packages.default = pkgs.haskellPackages.callPackage ./temple.nix {};
       }
     );
 }
