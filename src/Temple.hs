@@ -246,7 +246,7 @@ partExprParser =
 partIncludeParser :: Parser Part
 partIncludeParser =
   PartInclude
-    <$ try (openPragmaParser <* notFollowedBy (symbol $ fromString "end"))
+    <$ (try (openPragmaParser <* notFollowedBy (symbol $ fromString "end")) <?> "{%")
     <* symbol (fromString "include")
     <*> locatedParser (fmap Text.pack stringLiteralParser)
     <* closePragmaParser
@@ -347,7 +347,7 @@ atomParser =
                 (PartText . Text.pack)
                 ( some $
                     noneOf "\\{}\"\n"
-                      <|> try (char '{' <* notFollowedBy (char '{'))
+                      <|> try (char '{' <* notFollowedBy (char '{' <|> char '%'))
                       <|> try (char '}' <* notFollowedBy (char '}'))
                       <|> char '\\' *> (char '\\' <|> char '{' <|> char '}' <|> char '"' <|> ('\n' <$ char 'n'))
                 )
@@ -372,7 +372,7 @@ atomParser =
             ( (++)
                 <$> some
                   ( noneOf "\\{}\"\n"
-                      <|> try (char '{' <* notFollowedBy (char '{'))
+                      <|> try (char '{' <* notFollowedBy (char '{' <|> char '%'))
                       <|> try (char '}' <* notFollowedBy (char '}'))
                       <|> try doubleQuote1
                       <|> (char '\\' *> (char '\\' <|> char '{' <|> char '}' <|> char '"' <|> ('\n' <$ char 'n')))
@@ -381,6 +381,7 @@ atomParser =
             )
             <|> partExprParser
             <|> partIncludeParser
+            <|> PartText . Text.pack <$> fmap pure (char '\n' <* for_ mIndent (optional . indentParser))
         )
 
     indentParser total = go total <?> ("indentation (" ++ show total ++ " spaces)")

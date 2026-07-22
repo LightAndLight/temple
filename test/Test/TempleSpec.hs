@@ -1,16 +1,39 @@
 module Test.TempleSpec (spec) where
 
+import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as ByteString.Char8
+import Data.List (intercalate)
 import Data.String (fromString)
 import Temple (Expr (..), Located (..), Part (..), exprParser)
 import Test.Hspec (Spec, describe, it, shouldBe)
-import Text.Sage (parse)
+import Text.Sage (eof, parse)
 
 qqq :: String
 qqq = "\"\"\""
 
 spec :: Spec
 spec = do
+  describe "string" $ do
+    it "1" $ do
+      let
+        input1 =
+          ByteString.Char8.pack "\"asdf {% include "
+
+        input2 =
+          ByteString.Char8.pack "\"test\" %} asdf\""
+
+        input = input1 <> input2
+
+      parse (exprParser <* eof) input
+        `shouldBe` Right
+          ( Located 0 $
+              String
+                [ PartText $ fromString "asdf "
+                , PartInclude $ Located (ByteString.length input1) (fromString "test")
+                , PartText $ fromString " asdf"
+                ]
+          )
+
   describe "multiline string" $ do
     describe "single line" $ do
       it "1" $ do
@@ -19,7 +42,7 @@ spec = do
             ByteString.Char8.pack . unlines $
               [ qqq ++ qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [])
+        parse (exprParser <* eof) input `shouldBe` Right (Located 0 $ MultilineString [])
 
       it "2" $ do
         let
@@ -27,7 +50,7 @@ spec = do
             ByteString.Char8.pack . unlines $
               [ qqq ++ "hello" ++ qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
 
       it "3" $ do
@@ -37,7 +60,7 @@ spec = do
               [ qqq ++ "hello"
               , qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
     describe "many lines" $ do
@@ -48,7 +71,7 @@ spec = do
               [ qqq
               , "hello" ++ qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
 
       it "2" $ do
@@ -59,7 +82,7 @@ spec = do
               , "hello"
               , qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
       it "3" $ do
@@ -69,7 +92,7 @@ spec = do
               [ qqq
               , "  hello" ++ qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
 
       it "4" $ do
@@ -80,7 +103,7 @@ spec = do
               , "  hello"
               , qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
       it "5" $ do
@@ -91,7 +114,7 @@ spec = do
               , "  hello"
               , "  " ++ qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
       it "6" $ do
@@ -103,7 +126,7 @@ spec = do
               , "    b"
               , "  c" ++ qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right
             ( Located 0 $
                 MultilineString
@@ -123,12 +146,70 @@ spec = do
               , "  c"
               , "  " ++ qqq
               ]
-        parse exprParser input
+        parse (exprParser <* eof) input
           `shouldBe` Right
             ( Located 0 $
                 MultilineString
                   [ PartText $ fromString "a\n"
                   , PartText $ fromString "  b\n"
+                  , PartText $ fromString "c\n"
+                  ]
+            )
+
+      it "8" $ do
+        let
+          input1 =
+            ByteString.Char8.pack . intercalate "\n" $
+              [ qqq
+              , "  a"
+              , "  {% include "
+              ]
+
+          input2 =
+            ByteString.Char8.pack . unlines $
+              [ "\"test\" %}"
+              , "  c"
+              , "  " ++ qqq
+              ]
+
+          input = input1 <> input2
+
+        parse (exprParser <* eof) input
+          `shouldBe` Right
+            ( Located 0 $
+                MultilineString
+                  [ PartText $ fromString "a\n"
+                  , PartInclude $ Located (ByteString.length input1) (fromString "test")
+                  , PartText $ fromString "\n"
+                  , PartText $ fromString "c\n"
+                  ]
+            )
+
+      it "9" $ do
+        let
+          input1 =
+            ByteString.Char8.pack . intercalate "\n" $
+              [ qqq
+              , "  a"
+              , "  {{"
+              ]
+
+          input2 =
+            ByteString.Char8.pack . unlines $
+              [ "blah}}"
+              , "  c"
+              , "  " ++ qqq
+              ]
+
+          input = input1 <> input2
+
+        parse (exprParser <* eof) input
+          `shouldBe` Right
+            ( Located 0 $
+                MultilineString
+                  [ PartText $ fromString "a\n"
+                  , PartExpr $ Located (ByteString.length input1) (Var $ fromString "blah")
+                  , PartText $ fromString "\n"
                   , PartText $ fromString "c\n"
                   ]
             )
