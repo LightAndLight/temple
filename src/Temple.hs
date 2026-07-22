@@ -87,6 +87,7 @@ import Data.Functor (void)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import Data.List (find, intercalate)
+import Data.List.NonEmpty (NonEmpty)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
@@ -637,6 +638,8 @@ data Requirement
   = Requirement
   { reqName :: !Text
   , reqType :: !Type
+  , reqLocations :: NonEmpty (FilePath, Int)
+  -- ^ Places where the binding is introduced.
   , reqSatisfied :: !Bool
   }
 
@@ -756,7 +759,7 @@ checkExpr (Located offset (Var v)) t = do
   ty <-
     case mTy of
       Just ty -> instantiateTypeScheme ty
-      Nothing -> require v
+      Nothing -> require offset v
   unify offset t ty
 checkExpr (Located offset (String parts)) t = do
   unify offset t TString
@@ -830,21 +833,46 @@ checkPattern (Located offset (PConstructor name args)) t = do
   unify offset t (TSum $ TSumConstructor name (fmap snd argTys) rest)
   pure $ Map.fromList argTys
 
-require :: Monad m => Text -> InferT m Type
-require name = do
+require ::
+  Monad m =>
+  -- | Location of variable
+  Int ->
+  Text ->
+  InferT m Type
+require offset name = do
+  currentFile <- asks ieCurrentFile
   mReq <- lookupRequirement name
   case mReq of
     Nothing -> do
       ty <- metavar KType
-      InferT $ do
-        modify $ \s ->
-          s
-            { isRequirements =
-                isRequirements s ++ [Requirement{reqName = name, reqType = ty, reqSatisfied = False}]
-            }
+      InferT . modify $ \s ->
+        s
+          { isRequirements =
+              isRequirements s
+                ++ [ Requirement
+                       { reqName = name
+                       , reqType = ty
+                       , reqLocations = pure (currentFile, offset)
+                       , reqSatisfied = False
+                       }
+                   ]
+          }
       pure ty
-    Just req ->
+    Just req -> do
+      InferT . modify $ \s ->
+        s
+          { isRequirements =
+              updateRequirement
+                req{reqLocations = reqLocations req <> pure (currentFile, offset)}
+                (isRequirements s)
+          }
       pure $ reqType req
+
+updateRequirement :: Requirement -> [Requirement] -> [Requirement]
+updateRequirement _new [] = []
+updateRequirement new (req : reqs)
+  | reqName new == reqName req = new : reqs
+  | otherwise = req : updateRequirement new reqs
 
 metavar :: Monad m => Kind -> InferT m Type
 metavar kind = InferT $ do

@@ -9,6 +9,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Foldable (for_)
 import Data.List (find, intercalate)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (mapMaybe)
@@ -24,6 +25,7 @@ import Temple
   , Expr
   , InferEnv (..)
   , InferState (..)
+  , InferT
   , Kind (..)
   , Located (..)
   , Requirement (..)
@@ -57,6 +59,10 @@ data Cli
       !FilePath
       -- | Template arguments
       [String]
+  | Locate
+      !FilePath
+      -- | Variable to search for
+      String
 
 data Argument
   = Argument
@@ -78,6 +84,9 @@ cliParser =
         <> Options.command
           "apply"
           (Options.info applyParser (Options.progDesc "Apply a template to some arguments"))
+        <> Options.command
+          "locate"
+          (Options.info locateParser (Options.progDesc "List a variable's occurrances"))
     )
   where
     typeParser =
@@ -94,12 +103,18 @@ cliParser =
                 <> Options.help "Provide an argument to the template"
           )
 
+    locateParser =
+      Locate
+        <$> Options.strArgument (Options.metavar "FILE" <> Options.help "Source file")
+        <*> Options.strArgument (Options.metavar "VAR" <> Options.help "Variable to search for")
+
 main :: IO ()
 main = do
   cli <- Options.execParser $ Options.info (cliParser <**> Options.helper) Options.fullDesc
   case cli of
     Type file -> type_ file
     Apply file args -> apply file args
+    Locate file var -> locate file var
 
 data MultiReport
   = SingleReport Diagnostic.Report
@@ -299,7 +314,12 @@ renderKind :: Kind -> String
 renderKind KType = "Type"
 renderKind KRow = "Row"
 
-displayMultiReport :: FilePath -> (FilePath -> IO LazyByteString) -> MultiReport -> IO ()
+displayMultiReport ::
+  FilePath ->
+  -- | Read a file
+  (FilePath -> IO LazyByteString) ->
+  MultiReport ->
+  IO ()
 displayMultiReport file readFile' (SingleReport report) = displayReport file readFile' report
 displayMultiReport file readFile' (MultiReport report nextFile nextReport) = do
   displayReport file readFile' report
@@ -324,18 +344,25 @@ parseTemplate file = do
 defaultInferEnv :: FilePath -> InferEnv
 defaultInferEnv currentFile = (emptyInferEnv currentFile){ieScope = defaultScope}
 
-inferBindings :: FilePath -> Template -> IO (Map FilePath Template, [(Text, Type)])
+data Binding
+  = Binding
+  { bindingName :: !Text
+  , bindingType :: !Type
+  , bindingLocations :: !(NonEmpty (FilePath, Int))
+  }
+
+inferBindings :: FilePath -> Template -> IO (Map FilePath Template, [Binding])
 inferBindings file template = do
   result <-
     runInferT (defaultInferEnv file) emptyInferState $ do
       checkTemplate template
       requirements <- getRequirements
-      (traverse . traverse)
-        zonkDefault
+      traverse
+        zonkDefaultBinding
         ( mapMaybe
             ( \req -> do
                 guard . not $ reqSatisfied req
-                pure (reqName req, reqType req)
+                pure $ Binding (reqName req) (reqType req) (reqLocations req)
             )
             requirements
         )
@@ -345,15 +372,20 @@ inferBindings file template = do
       displayMultiReport file LazyByteString.readFile $ typeError err
       exitFailure
     Right (state, bindings) -> pure (isDependencies state, bindings)
+  where
+    zonkDefaultBinding :: Monad m => Binding -> InferT m Binding
+    zonkDefaultBinding binding = do
+      type' <- zonkDefault $ bindingType binding
+      pure binding{bindingType = type'}
 
 type_ :: FilePath -> IO ()
 type_ file = do
   template <- parseTemplate file
   (_deps, bindings) <- inferBindings file template
-  for_ bindings $ \(binding, ty) -> do
-    Text.putStr binding
+  for_ bindings $ \binding -> do
+    Text.putStr $ bindingName binding
     putStr " : "
-    putStrLn $ renderType ty
+    putStrLn . renderType $ bindingType binding
 
 apply :: FilePath -> [String] -> IO ()
 apply file args = do
@@ -374,17 +406,18 @@ apply file args = do
   (deps, bindings) <- inferBindings file template
 
   scope <-
-    for bindings $ \(name, ty) -> do
-      case find ((name ==) . argName . (\(_, _, x) -> x)) args' of
+    for bindings $ \binding -> do
+      case find ((bindingName binding ==) . argName . (\(_, _, x) -> x)) args' of
         Nothing -> do
-          putStrLn $ "error: argument " ++ Text.unpack name ++ " not provided"
+          putStrLn $ "error: argument " ++ Text.unpack (bindingName binding) ++ " not provided"
           exitFailure
         Just (index, argPlain, arg) -> do
-          result <- runInferT (emptyInferEnv ".") emptyInferState $ checkExpr (argValue arg) ty
+          result <-
+            runInferT (emptyInferEnv ".") emptyInferState $ checkExpr (argValue arg) (bindingType binding)
 
           case result of
             Right (_state, ()) ->
-              pure (name, argValue arg)
+              pure (bindingName binding, argValue arg)
             Left err -> do
               displayMultiReport
                 (fromString $ "(argument " ++ show index ++ ")")
@@ -399,3 +432,39 @@ apply file args = do
 
   LazyByteString.putStrLn $
     evalTemplate (defaultEvalEnv file deps){eeScope = Map.fromList scope' <> defaultCtx} template
+
+locate :: FilePath -> String -> IO ()
+locate file var = do
+  template <- parseTemplate file
+
+  (_deps, bindings) <- inferBindings file template
+
+  case find ((fromString var ==) . bindingName) bindings of
+    Nothing -> do
+      putStrLn $ "error: variable '" ++ var ++ "' not found"
+    Just binding -> do
+      let
+        makeReports bindingFile bindingOffset rest =
+          let
+            report =
+              Diagnostic.emit
+                (Diagnostic.Offset bindingOffset)
+                Diagnostic.Caret
+                (fromString "variable found")
+          in
+            ( bindingFile
+            , case rest of
+                [] -> SingleReport report
+                (bindingFile', bindingOffset') : rest' ->
+                  let
+                    (bindingFile'', reports'') = makeReports bindingFile' bindingOffset' rest'
+                  in
+                    MultiReport report bindingFile'' reports''
+            )
+
+        (reportsFile, reports) =
+          case bindingLocations binding of
+            (bindingFile, bindingOffset) :| rest ->
+              makeReports bindingFile bindingOffset rest
+
+      displayMultiReport reportsFile LazyByteString.readFile reports
