@@ -525,6 +525,7 @@ data TypeError
 
 data Type
   = TMeta !Int
+  | TVar !Text
   | TBool
   | TString
   | TFn ![Type] Type
@@ -548,6 +549,22 @@ data Type
   | TRowEnd
   deriving (Show)
 
+subst :: Map Text Type -> Type -> Type
+subst sub ty@(TVar v) =
+  case Map.lookup v sub of
+    Nothing -> ty
+    Just ty' -> ty'
+subst _ ty@TMeta{} = ty
+subst _ TBool = TBool
+subst _ TString = TString
+subst sub (TFn args ret) = TFn (fmap (subst sub) args) (subst sub ret)
+subst sub (TStream item) = TStream (subst sub item)
+subst sub (TRecord fields) = TRecord (subst sub fields)
+subst sub (TRecordField name ty rest) = TRecordField name (subst sub ty) (subst sub rest)
+subst sub (TSum ctors) = TSum (subst sub ctors)
+subst sub (TSumConstructor name tys rest) = TSumConstructor name (fmap (subst sub) tys) (subst sub rest)
+subst _ TRowEnd = TRowEnd
+
 newtype InferT m a = InferT (ReaderT InferEnv (StateT InferState (ExceptT TypeError m)) a)
   deriving (Functor, Applicative, Monad, MonadIO, MonadReader InferEnv, MonadError TypeError)
 
@@ -557,8 +574,10 @@ runInferT e s (InferT ma) = runExceptT . fmap Tuple.swap . flip runStateT s . fl
 data InferEnv
   = InferEnv
   { ieCurrentFile :: !FilePath
-  , ieScope :: !(Map Text Type)
+  , ieScope :: !(Map Text TypeScheme)
   }
+
+data TypeScheme = Forall ![Text] Type
 
 emptyInferEnv ::
   -- | Current file
@@ -566,7 +585,7 @@ emptyInferEnv ::
   InferEnv
 emptyInferEnv currentFile = InferEnv{ieCurrentFile = currentFile, ieScope = mempty}
 
-builtins :: Map Text (Value, Type)
+builtins :: Map Text (Value, TypeScheme)
 builtins =
   let
     strip =
@@ -578,13 +597,19 @@ builtins =
         ( fromString "strip"
         ,
           ( VFn . Fn $ \case [s] -> VString . strip $ valueString s; _ -> undefined
-          , TFn [TString] TString
+          , Forall [] $ TFn [TString] TString
+          )
+        ),
+        ( fromString "is-empty"
+        ,
+          ( VFn . Fn $ \case [s] -> if null $ valueStream s then VTrue else VFalse; _ -> undefined
+          , Forall [fromString "a"] $ TFn [TStream $ TVar (fromString "a")] TBool
           )
         )
       ]
 
 -- | @defaultScope = fmap snd 'builtins'@
-defaultScope :: Map Text Type
+defaultScope :: Map Text TypeScheme
 defaultScope = fmap snd builtins
 
 data InferState
@@ -696,6 +721,11 @@ checkPart (PartInclude target) = do
       `catchError` (throwError . IncludeTypeError (locatedOffset target) includePath )
   addDependency includePath includeTemplate
 
+instantiateTypeScheme :: Monad m => TypeScheme -> InferT m Type
+instantiateTypeScheme (Forall vars ty) = do
+  sub <- Map.fromList <$> traverse (\var -> (,) var <$> metavar KType) vars
+  pure $ subst sub ty
+
 checkExpr ::
   MonadIO m =>
   Located Expr ->
@@ -705,7 +735,7 @@ checkExpr (Located offset (Var v)) t = do
   mTy <- asks (Map.lookup v . ieScope)
   ty <-
     case mTy of
-      Just ty -> pure ty
+      Just ty -> instantiateTypeScheme ty
       Nothing -> require v
   unify offset t ty
 checkExpr (Located offset (String parts)) t = do
@@ -720,7 +750,7 @@ checkExpr (Located offset (Call name args)) t = do
   ty <-
     case mTy of
       Nothing -> throwError $ NotInScope (locatedOffset name)
-      Just ty -> pure ty
+      Just ty -> instantiateTypeScheme ty
   unify offset (TFn argTys t) ty
   for_ (zip args argTys) $ \(arg, argTy) -> do
     checkExpr arg argTy
@@ -746,7 +776,7 @@ checkExpr (Located _offset (Match e bs)) t = do
   eTy <- inferExpr e
   for_ bs $ \(Branch p body) -> do
     bindings <- checkPattern p eTy
-    local (\env -> env{ieScope = bindings <> ieScope env}) $ checkExpr body t
+    local (\env -> env{ieScope = fmap (Forall []) bindings <> ieScope env}) $ checkExpr body t
 checkExpr (Located _offset (IfThenElse cond th el)) t = do
   checkExpr cond TBool
   checkExpr th t
@@ -761,7 +791,7 @@ checkExpr (Located offset (For name items value)) t = do
   unify offset t (TStream valueTy)
   itemTy <- metavar KType
   checkExpr items (TStream itemTy)
-  local (\env -> env{ieScope = Map.insert name itemTy $ ieScope env}) $
+  local (\env -> env{ieScope = Map.insert name (Forall [] itemTy) $ ieScope env}) $
     checkExpr value valueTy
 
 inferExpr :: MonadIO m => Located Expr -> InferT m Type
@@ -819,6 +849,12 @@ unify ::
   InferT m ()
 unify offset (TMeta m) ty = solveL offset m ty
 unify offset ty (TMeta m) = solveR offset ty m
+unify offset (TVar v) ty =
+  case ty of
+    TVar v' | v == v' -> pure ()
+    _ -> do
+      ty' <- zonk False ty
+      throwError $ TypeMismatch offset (TVar v) ty'
 unify offset TBool ty =
   case ty of
     TBool -> pure ()
@@ -960,6 +996,7 @@ kindOf (TMeta v) = do
   case mMeta of
     Nothing -> error $ "missing metavar: " ++ show v
     Just meta -> pure $ metaKind meta
+kindOf TVar{} = pure KType
 kindOf TBool = pure KType
 kindOf TString = pure KType
 kindOf TFn{} = pure KType
@@ -1145,6 +1182,7 @@ zonk def (TMeta v) = do
               | def -> TRowEnd
               | otherwise -> TMeta v
       maybe (pure defTy) (zonk def) (metaSolution meta)
+zonk _def (TVar v) = pure (TVar v)
 zonk _def TBool = pure TBool
 zonk _def TString = pure TString
 zonk def (TFn args retTy) = TFn <$> traverse (zonk def) args <*> zonk def retTy

@@ -264,6 +264,7 @@ renderConstructors xs =
 
 renderType :: Type -> String
 renderType (TMeta v) = "?" ++ show v
+renderType (TVar v) = Text.unpack v
 renderType TBool = "Bool"
 renderType TString = "String"
 renderType (TFn args retTy) = "Fn(" ++ intercalate ", " (fmap renderType args) ++ ") -> " ++ renderType retTy
