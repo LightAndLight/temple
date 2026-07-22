@@ -9,6 +9,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Foldable (for_)
 import Data.List (find, intercalate)
+import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (mapMaybe)
 import Data.String (fromString)
@@ -19,8 +20,10 @@ import Data.Traversable (for)
 import qualified Options.Applicative as Options
 import System.Exit (exitFailure)
 import Temple
-  ( Expr
+  ( EvalEnv (..)
+  , Expr
   , InferEnv (..)
+  , InferState (..)
   , Kind (..)
   , Located (..)
   , Requirement (..)
@@ -28,14 +31,12 @@ import Temple
   , Type (..)
   , TypeError (..)
   , checkExpr
-  , defaultEvalEnv
-  , EvalEnv(..)
   , checkTemplate
   , defaultCtx
+  , defaultEvalEnv
   , defaultScope
   , emptyInferEnv
   , emptyInferState
-  , InferState(..)
   , evalExpr
   , evalTemplate
   , exprParser
@@ -49,7 +50,6 @@ import Temple
 import qualified Text.Diagnostic as Diagnostic
 import qualified Text.Diagnostic.Sage
 import qualified Text.Sage as Sage
-import Data.Map (Map)
 
 data Cli
   = Type !FilePath
@@ -204,6 +204,12 @@ typeError (BlockBadRequirementType offset actual) =
       (Diagnostic.Offset offset)
       Diagnostic.Caret
       (fromString $ "requirement of type " ++ renderType actual ++ " cannot be satisfied by a block")
+typeError (FileNotFound offset) =
+  SingleReport $
+    Diagnostic.emit
+      (Diagnostic.Offset offset)
+      Diagnostic.Caret
+      (fromString "file not found")
 typeError (ParentParseError offset file err) =
   -- TODO: extend `diagnostica` to handle this sort of nesting?
   MultiReport

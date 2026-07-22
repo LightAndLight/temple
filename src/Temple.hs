@@ -51,7 +51,7 @@ module Temple
   , evalTemplate
   , evalPart
   , evalExpr
-  , EvalEnv(..)
+  , EvalEnv (..)
   , defaultEvalEnv
   , defaultCtx
 
@@ -68,6 +68,7 @@ module Temple
 where
 
 import Control.Applicative (empty, many, optional, some, (<|>))
+import Control.Exception (catch, throwIO)
 import Control.Monad (guard, unless, when)
 import Control.Monad.Error.Class (MonadError, catchError, throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
@@ -98,6 +99,7 @@ import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Data.Tuple as Tuple
 import System.FilePath (takeDirectory, (</>))
+import System.IO.Error (isDoesNotExistError)
 import Text.Sage (Parser, char, notFollowedBy, satisfy, sepBy, skipMany, string, try, (<?>))
 import qualified Text.Sage as Sage
 
@@ -175,9 +177,9 @@ templateParser path =
     <|> TemplateBase path <$> many partParser
   where
     pragmaExtendsParser =
-      try (openPragmaParser *> symbol (fromString "extends")) *>
-        locatedParser stringLiteralParser  <*
-        token closePragmaParser
+      try (openPragmaParser *> symbol (fromString "extends"))
+        *> locatedParser stringLiteralParser
+        <* token closePragmaParser
 
 openPragmaParser :: Parser ()
 openPragmaParser = void . symbol $ fromString "{%"
@@ -243,10 +245,11 @@ partExprParser =
 
 partIncludeParser :: Parser Part
 partIncludeParser =
-  PartInclude <$
-    try (openPragmaParser <* notFollowedBy (symbol $ fromString "end")) <* symbol (fromString "include") <*>
-    locatedParser (fmap Text.pack stringLiteralParser) <*
-    closePragmaParser
+  PartInclude
+    <$ try (openPragmaParser <* notFollowedBy (symbol $ fromString "end"))
+    <* symbol (fromString "include")
+    <*> locatedParser (fmap Text.pack stringLiteralParser)
+    <* closePragmaParser
 
 kIf, kThen, kElse, kFor, kIn, kYield, kMatch :: Text
 kIf = fromString "if"
@@ -498,6 +501,9 @@ data TypeError
   | RequirementAlreadySatisfied
       -- | Source offset of error
       !Int
+  | FileNotFound
+      -- | Source offset filepath
+      !Int
   | ParentParseError
       -- | Source offset of parent filepath
       !Int
@@ -599,7 +605,8 @@ builtins =
           ( VFn . Fn $ \case [s] -> VString . strip $ valueString s; _ -> undefined
           , Forall [] $ TFn [TString] TString
           )
-        ),
+        )
+      ,
         ( fromString "is-empty"
         ,
           ( VFn . Fn $ \case [s] -> if null $ valueStream s then VTrue else VFalse; _ -> undefined
@@ -648,16 +655,22 @@ checkTemplate :: MonadIO m => Template -> InferT m ()
 checkTemplate (TemplateBase _file parts) = traverse_ checkPart parts
 checkTemplate (TemplateChild file parent pragmas) = do
   let parentPath = takeDirectory file </> locatedValue parent
-  content <- liftIO $ ByteString.readFile parentPath
-  parentTemplate <-
-    case Sage.parse (templateParser file <* Sage.eof) content of
-      Left err -> throwError $ ParentParseError (locatedOffset parent) parentPath err
-      Right x -> pure x
-  local (\env -> env{ieCurrentFile = parentPath}) $
-    checkTemplate parentTemplate
-      `catchError` (throwError . ParentTypeError (locatedOffset parent) parentPath)
-  traverse_ checkPragma pragmas
-  addDependency parentPath parentTemplate
+  mContent <-
+    liftIO $
+      fmap Just (ByteString.readFile parentPath)
+        `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
+  case mContent of
+    Nothing -> throwError $ FileNotFound (locatedOffset parent)
+    Just content -> do
+      parentTemplate <-
+        case Sage.parse (templateParser file <* Sage.eof) content of
+          Left err -> throwError $ ParentParseError (locatedOffset parent) parentPath err
+          Right x -> pure x
+      local (\env -> env{ieCurrentFile = parentPath}) $
+        checkTemplate parentTemplate
+          `catchError` (throwError . ParentTypeError (locatedOffset parent) parentPath)
+      traverse_ checkPragma pragmas
+      addDependency parentPath parentTemplate
 
 checkPragma :: MonadIO m => Pragma -> InferT m ()
 checkPragma (PragmaBlock name parts) = do
@@ -711,15 +724,21 @@ checkPart (PartInclude target) = do
   currentFile <- asks ieCurrentFile
 
   let includePath = takeDirectory currentFile </> Text.unpack (locatedValue target)
-  content <- liftIO $ ByteString.readFile includePath
-  includeTemplate <-
-    case Sage.parse (templateParser currentFile <* Sage.eof) content of
-      Left err -> throwError $ IncludeParseError (locatedOffset target) includePath err
-      Right x -> pure x
-  local (\env -> env{ieCurrentFile = includePath}) $
-    checkTemplate includeTemplate
-      `catchError` (throwError . IncludeTypeError (locatedOffset target) includePath )
-  addDependency includePath includeTemplate
+  mContent <-
+    liftIO $
+      fmap Just (ByteString.readFile includePath)
+        `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
+  case mContent of
+    Nothing -> throwError $ FileNotFound (locatedOffset target)
+    Just content -> do
+      includeTemplate <-
+        case Sage.parse (templateParser currentFile <* Sage.eof) content of
+          Left err -> throwError $ IncludeParseError (locatedOffset target) includePath err
+          Right x -> pure x
+      local (\env -> env{ieCurrentFile = includePath}) $
+        checkTemplate includeTemplate
+          `catchError` (throwError . IncludeTypeError (locatedOffset target) includePath)
+      addDependency includePath includeTemplate
 
 instantiateTypeScheme :: Monad m => TypeScheme -> InferT m Type
 instantiateTypeScheme (Forall vars ty) = do
@@ -1242,10 +1261,10 @@ defaultEvalEnv ::
   EvalEnv
 defaultEvalEnv currentFile dependencies =
   EvalEnv
-  { eeCurrentFile = currentFile
-  , eeDependencies = dependencies
-  , eeScope = defaultCtx
-  }
+    { eeCurrentFile = currentFile
+    , eeDependencies = dependencies
+    , eeScope = defaultCtx
+    }
 
 -- | @defaultCtx = fmap fst 'builtins'@
 defaultCtx :: Map Text Value
@@ -1259,7 +1278,7 @@ evalTemplate env (TemplateChild file parent pragmas) =
     parentPath = takeDirectory file </> locatedValue parent
     template =
       fromMaybe (error $ "missing dependency: " ++ parentPath) $
-      Map.lookup parentPath (eeDependencies env)
+        Map.lookup parentPath (eeDependencies env)
     !ctx' = Map.fromList $ foldMap (evalPragma env) pragmas
   in
     evalTemplate env{eeScope = ctx' <> eeScope env} template
@@ -1285,7 +1304,8 @@ evalPart env (PartInclude file) =
     includePath = takeDirectory (eeCurrentFile env) </> Text.unpack (locatedValue file)
     template =
       fromMaybe (error $ "missing dependency: " ++ includePath) $
-      Map.lookup includePath $ eeDependencies env
+        Map.lookup includePath $
+          eeDependencies env
   in
     evalTemplate env{eeCurrentFile = includePath} template
 
@@ -1356,7 +1376,7 @@ evalExpr env (Array items) =
   VStream [evalExpr env (locatedValue item) | item <- items]
 evalExpr env (For name xs yield) =
   let
-    xs' = valueStream $ evalExpr env(locatedValue xs)
+    xs' = valueStream $ evalExpr env (locatedValue xs)
   in
     VStream [evalExpr env{eeScope = Map.insert name x' $ eeScope env} (locatedValue yield) | x' <- xs']
 

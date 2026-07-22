@@ -2,7 +2,7 @@ module Test.TempleSpec (spec) where
 
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.String (fromString)
-import Temple (Expr (..), Part (..), exprParser, Located(..))
+import Temple (Expr (..), Located (..), Part (..), exprParser)
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Text.Sage (parse)
 
@@ -27,7 +27,8 @@ spec = do
             ByteString.Char8.pack . unlines $
               [ qqq ++ "hello" ++ qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
+        parse exprParser input
+          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
 
       it "3" $ do
         let
@@ -36,7 +37,8 @@ spec = do
               [ qqq ++ "hello"
               , qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+        parse exprParser input
+          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
     describe "many lines" $ do
       it "1" $ do
@@ -46,7 +48,8 @@ spec = do
               [ qqq
               , "hello" ++ qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
+        parse exprParser input
+          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
 
       it "2" $ do
         let
@@ -56,7 +59,8 @@ spec = do
               , "hello"
               , qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+        parse exprParser input
+          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
       it "3" $ do
         let
@@ -65,7 +69,8 @@ spec = do
               [ qqq
               , "  hello" ++ qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
+        parse exprParser input
+          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
 
       it "4" $ do
         let
@@ -75,7 +80,8 @@ spec = do
               , "  hello"
               , qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+        parse exprParser input
+          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
       it "5" $ do
         let
@@ -85,7 +91,8 @@ spec = do
               , "  hello"
               , "  " ++ qqq
               ]
-        parse exprParser input `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+        parse exprParser input
+          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
 
       it "6" $ do
         let
@@ -99,11 +106,11 @@ spec = do
         parse exprParser input
           `shouldBe` Right
             ( Located 0 $
-              MultilineString
-                [ PartText $ fromString "a\n"
-                , PartText $ fromString "  b\n"
-                , PartText $ fromString "c"
-                ]
+                MultilineString
+                  [ PartText $ fromString "a\n"
+                  , PartText $ fromString "  b\n"
+                  , PartText $ fromString "c"
+                  ]
             )
 
       it "7" $ do
@@ -118,9 +125,10 @@ spec = do
               ]
         parse exprParser input
           `shouldBe` Right
-            ( Located 0 $ MultilineString
-                [ PartText $ fromString "a\n"
-                , PartText $ fromString "  b\n"
-                , PartText $ fromString "c\n"
-                ]
+            ( Located 0 $
+                MultilineString
+                  [ PartText $ fromString "a\n"
+                  , PartText $ fromString "  b\n"
+                  , PartText $ fromString "c\n"
+                  ]
             )
