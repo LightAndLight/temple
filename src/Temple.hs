@@ -61,6 +61,7 @@ module Temple
 
     -- ** Values
   , Value (..)
+  , Fn(..)
   , valueBool
   , valueString
   , valueRecord
