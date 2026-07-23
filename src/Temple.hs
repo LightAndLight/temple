@@ -29,6 +29,7 @@ module Temple
   , symbolic
 
     -- * Typing
+  , TypeScheme(..)
   , Type (..)
   , Kind (..)
   , TypeError (..)
