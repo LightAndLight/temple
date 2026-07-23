@@ -7,6 +7,7 @@ module Temple
   ( -- * Syntax
     Template (..)
   , Part (..)
+  , Pragma (..)
   , Expr (..)
   , Field (..)
   , Branch (..)
@@ -14,6 +15,8 @@ module Temple
   , Located (..)
 
     -- * Parsing
+  , parse
+  , Sage.ParseError (..)
   , templateParser
   , partParser
   , exprParser
@@ -175,6 +178,17 @@ data Branch
 data Pattern
   = PConstructor !Text ![Text]
   deriving (Show, Eq)
+
+parse ::
+  {-| Path of file being parsed
+
+  Used to resolve @include@s and @extend@s.
+  -}
+  FilePath ->
+  -- | Input to parse
+  ByteString ->
+  Either Sage.ParseError Template
+parse path = Sage.parse (templateParser path)
 
 templateParser :: FilePath -> Parser Template
 templateParser path =
