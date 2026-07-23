@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 
@@ -29,12 +30,14 @@ module Temple
   , symbolic
 
     -- * Typing
-  , TypeScheme(..)
+  , TypeScheme (..)
   , Type (..)
   , Kind (..)
   , TypeError (..)
 
     -- ** Type inference
+  , Binding (..)
+  , inferBindings
   , InferT
   , InferState (..)
   , emptyInferState
@@ -42,6 +45,7 @@ module Temple
   , getRequirements
   , InferEnv (..)
   , emptyInferEnv
+  , defaultInferEnv
   , defaultScope
   , runInferT
   , checkTemplate
@@ -61,7 +65,7 @@ module Temple
 
     -- ** Values
   , Value (..)
-  , Fn(..)
+  , Fn (..)
   , valueBool
   , valueString
   , valueRecord
@@ -96,7 +100,7 @@ import Data.List (find, intercalate)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
@@ -603,6 +607,44 @@ subst sub (TSum ctors) = TSum (subst sub ctors)
 subst sub (TSumConstructor name tys rest) = TSumConstructor name (fmap (subst sub) tys) (subst sub rest)
 subst _ TRowEnd = TRowEnd
 
+data Binding
+  = Binding
+  { bindingName :: !Text
+  , bindingType :: !Type
+  , bindingLocations :: !(NonEmpty (FilePath, Int))
+  }
+
+inferBindings ::
+  (MonadError TypeError m, MonadIO m) =>
+  FilePath ->
+  Template ->
+  m (Map FilePath Template, [Binding])
+inferBindings file template = do
+  result <-
+    runInferT (defaultInferEnv file) emptyInferState $ do
+      checkTemplate template
+      requirements <- getRequirements
+      traverse
+        zonkDefaultBinding
+        ( mapMaybe
+            ( \req -> do
+                guard . not $ reqSatisfied req
+                pure $ Binding (reqName req) (reqType req) (reqLocations req)
+            )
+            requirements
+        )
+
+  case result of
+    Left err ->
+      throwError err
+    Right (state, bindings) ->
+      pure (isDependencies state, bindings)
+  where
+    zonkDefaultBinding :: Monad m => Binding -> InferT m Binding
+    zonkDefaultBinding binding = do
+      type' <- zonkDefault $ bindingType binding
+      pure binding{bindingType = type'}
+
 newtype InferT m a = InferT (ReaderT InferEnv (StateT InferState (ExceptT TypeError m)) a)
   deriving (Functor, Applicative, Monad, MonadIO, MonadReader InferEnv, MonadError TypeError)
 
@@ -622,6 +664,9 @@ emptyInferEnv ::
   FilePath ->
   InferEnv
 emptyInferEnv currentFile = InferEnv{ieCurrentFile = currentFile, ieScope = mempty}
+
+defaultInferEnv :: FilePath -> InferEnv
+defaultInferEnv currentFile = (emptyInferEnv currentFile){ieScope = defaultScope}
 
 builtins :: Map Text (Value, TypeScheme)
 builtins =

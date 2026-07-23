@@ -3,7 +3,7 @@
 module Main (main) where
 
 import Control.Applicative (many, (<**>))
-import Control.Monad (guard)
+import Control.Monad.Except (runExceptT)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
@@ -12,7 +12,6 @@ import Data.List (find, intercalate)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (mapMaybe)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -21,34 +20,28 @@ import Data.Traversable (for)
 import qualified Options.Applicative as Options
 import System.Exit (exitFailure)
 import Temple
-  ( EvalEnv (..)
+  ( Binding (..)
+  , EvalEnv (..)
   , Expr
-  , InferEnv (..)
-  , InferState (..)
-  , InferT
   , Kind (..)
   , Located (..)
-  , Requirement (..)
   , Template
   , Type (..)
   , TypeError (..)
   , checkExpr
-  , checkTemplate
   , defaultCtx
   , defaultEvalEnv
-  , defaultScope
   , emptyInferEnv
   , emptyInferState
   , evalExpr
   , evalTemplate
   , exprParser
-  , getRequirements
   , identParser
   , runInferT
   , symbolic
   , templateParser
-  , zonkDefault
   )
+import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
 import qualified Text.Diagnostic.Sage
 import qualified Text.Sage as Sage
@@ -353,42 +346,19 @@ parseTemplate file = do
       exitFailure
     Right x -> pure x
 
-defaultInferEnv :: FilePath -> InferEnv
-defaultInferEnv currentFile = (emptyInferEnv currentFile){ieScope = defaultScope}
-
-data Binding
-  = Binding
-  { bindingName :: !Text
-  , bindingType :: !Type
-  , bindingLocations :: !(NonEmpty (FilePath, Int))
-  }
-
-inferBindings :: FilePath -> Template -> IO (Map FilePath Template, [Binding])
+inferBindings ::
+  FilePath ->
+  Template ->
+  IO (Map FilePath Template, [Binding])
 inferBindings file template = do
-  result <-
-    runInferT (defaultInferEnv file) emptyInferState $ do
-      checkTemplate template
-      requirements <- getRequirements
-      traverse
-        zonkDefaultBinding
-        ( mapMaybe
-            ( \req -> do
-                guard . not $ reqSatisfied req
-                pure $ Binding (reqName req) (reqType req) (reqLocations req)
-            )
-            requirements
-        )
+  result <- runExceptT $ Temple.inferBindings file template
 
   case result of
     Left err -> do
       displayMultiReport file LazyByteString.readFile $ typeError err
       exitFailure
-    Right (state, bindings) -> pure (isDependencies state, bindings)
-  where
-    zonkDefaultBinding :: Monad m => Binding -> InferT m Binding
-    zonkDefaultBinding binding = do
-      type' <- zonkDefault $ bindingType binding
-      pure binding{bindingType = type'}
+    Right x ->
+      pure x
 
 type_ :: FilePath -> IO ()
 type_ file = do
