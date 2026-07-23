@@ -77,6 +77,7 @@ import Control.Monad.Reader (ReaderT, runReaderT)
 import Control.Monad.Reader.Class (MonadReader, asks, local)
 import Control.Monad.State (StateT, runStateT)
 import Control.Monad.State.Class (get, gets, modify, put)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
@@ -98,6 +99,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
+import qualified Data.Text.Read as Text.Read
 import qualified Data.Tuple as Tuple
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Error (isDoesNotExistError)
@@ -599,6 +601,105 @@ builtins =
     strip =
       ByteString.Lazy.Char8.dropWhileEnd Char.isSpace
         . ByteString.Lazy.Char8.dropWhile Char.isSpace
+
+    plaintext :: LazyByteString -> LazyByteString
+    plaintext input =
+      let (prefix, rest) = ByteString.Lazy.Char8.break (\c -> c == '<' || c == '&') input
+      in case ByteString.Lazy.Char8.uncons rest of
+           Nothing -> prefix
+           Just (c, rest') ->
+             case c of
+               '<' -> prefix <> plaintext (skip rest')
+               '&' ->
+                 case reference rest' of
+                   Just (c', rest'') -> prefix <> c' <> plaintext rest''
+                   Nothing -> prefix <> fromString "&" <> plaintext rest'
+               _ -> undefined
+      where
+        skip :: LazyByteString -> LazyByteString
+        skip x
+          | Just x' <- ByteString.Lazy.Char8.stripPrefix (fromString "!--") x =
+              dropThrough (fromString "-->") x'
+          | Just x' <- ByteString.Lazy.Char8.stripPrefix (fromString "![CDATA[") x =
+              dropThrough (fromString "]]>") x'
+          | otherwise = inTag x
+
+        -- \| Lazy version of 'ByteString.breakSubstring'
+        breakSubstringLBS :: ByteString -> LazyByteString -> (ByteString, LazyByteString)
+        breakSubstringLBS pat
+          | ByteString.null pat = \rest -> (mempty, rest)
+          | otherwise = go id mempty . LazyByteString.toChunks
+          where
+            keep = ByteString.length pat - 1
+
+            go acc buffer [] = (ByteString.concat (acc [buffer]), mempty)
+            go acc buffer (chunk : chunks) =
+              let
+                s = buffer <> chunk
+                (before, rest) = ByteString.breakSubstring pat s
+              in
+                if ByteString.null rest
+                  then
+                    let (done, buffer') = ByteString.splitAt (ByteString.length s - keep) s
+                    in go (acc . (done :)) buffer' chunks
+                  else
+                    (ByteString.concat (acc [before]), LazyByteString.fromChunks (rest : chunks))
+
+        dropThrough :: ByteString -> LazyByteString -> LazyByteString
+        dropThrough end x =
+          let (_, x') = breakSubstringLBS end x
+          in if LazyByteString.null x'
+               then fromString ""
+               else LazyByteString.drop (fromIntegral $ ByteString.length end) x'
+
+        inTag :: LazyByteString -> LazyByteString
+        inTag x =
+          let x' = ByteString.Lazy.Char8.dropWhile (\c -> c /= '>' && c /= '"' && c /= '\'') x
+          in case ByteString.Lazy.Char8.uncons x' of
+               Nothing ->
+                 fromString ""
+               Just ('>', x'') ->
+                 x''
+               Just (quoteChar, x'') ->
+                 inTag (LazyByteString.drop 1 (ByteString.Lazy.Char8.dropWhile (/= quoteChar) x''))
+
+        reference :: LazyByteString -> Maybe (LazyByteString, LazyByteString)
+        reference x = do
+          let (name, rest) = ByteString.Lazy.Char8.span (\c -> Char.isAlphaNum c || c == '#') x
+          rest' <- LazyByteString.stripPrefix (fromString ";") rest
+          c <- entity name
+          pure (c, rest')
+
+        entity :: LazyByteString -> Maybe LazyByteString
+        entity name
+          | Just num <- LazyByteString.stripPrefix (fromString "#") name = numeric num
+          | otherwise = lookup name named
+          where
+            named =
+              [ (fromString "amp", fromString "&")
+              , (fromString "lt", fromString "<")
+              , (fromString "gt", fromString ">")
+              , (fromString "quot", fromString "\"")
+              , (fromString "apos", fromString "'")
+              , (fromString "nbsp", fromString "\xa0")
+              ]
+
+            numeric :: LazyByteString -> Maybe LazyByteString
+            numeric num
+              | Just h <-
+                  LazyByteString.stripPrefix (fromString "x") num <|> LazyByteString.stripPrefix (fromString "X") num =
+                  toChar . Text.Read.hexadecimal . Text.Encoding.decodeUtf8 $ LazyByteString.toStrict h
+              | otherwise =
+                  toChar . Text.Read.decimal . Text.Encoding.decodeUtf8 $ LazyByteString.toStrict num
+
+            toChar :: Either a (Int, Text) -> Maybe LazyByteString
+            toChar (Right (n, r))
+              | Text.null r
+              , n >= 0
+              , n <= 0x10FFFF =
+                  Just . LazyByteString.fromStrict . Text.Encoding.encodeUtf8 . Text.singleton $ Char.chr n
+            toChar _ =
+              Nothing
   in
     Map.fromList
       [
@@ -613,6 +714,13 @@ builtins =
         ,
           ( VFn . Fn $ \case [s] -> if null $ valueStream s then VTrue else VFalse; _ -> undefined
           , Forall [fromString "a"] $ TFn [TStream $ TVar (fromString "a")] TBool
+          )
+        )
+      ,
+        ( fromString "plaintext"
+        ,
+          ( VFn . Fn $ \case [s] -> VString (plaintext $ valueString s); _ -> undefined
+          , Forall [] $ TFn [TString] TString
           )
         )
       ]

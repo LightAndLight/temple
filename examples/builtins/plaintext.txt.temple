@@ -1,0 +1,7 @@
+The following may contain HTML tags:
+
+{{input}}
+
+But `plaintext` will strip those tags, HTML comments, and decode HTML entities (e.g. `&nbsp;`):
+
+{{plaintext(input)}}
