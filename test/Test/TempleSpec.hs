@@ -29,7 +29,7 @@ spec = do
           ( Located 0 $
               String
                 [ PartText $ fromString "asdf "
-                , PartInclude $ Located (ByteString.length input1) (fromString "test")
+                , PartInclude (Located (ByteString.length input1) (fromString "test")) Nothing
                 , PartText $ fromString " asdf"
                 ]
           )
@@ -179,7 +179,7 @@ spec = do
             ( Located 0 $
                 MultilineString
                   [ PartText $ fromString "a\n"
-                  , PartInclude $ Located (ByteString.length input1) (fromString "test")
+                  , PartInclude (Located (ByteString.length input1) (fromString "test")) Nothing
                   , PartText $ fromString "\n"
                   , PartText $ fromString "c\n"
                   ]

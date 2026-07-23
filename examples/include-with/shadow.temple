@@ -1,0 +1,2 @@
+With outer: {{name}}
+With inner: {% include "x.temple" with name = "Bound" %}

@@ -206,7 +206,7 @@ typeError (NotRequirement offset _name) =
     Diagnostic.emit
       (Diagnostic.Offset offset)
       Diagnostic.Caret
-      (fromString "block does not satisfy a known requirement")
+      (fromString "does not satisfy a known requirement")
 typeError (RequirementAlreadySatisfied offset) =
   SingleReport $
     Diagnostic.emit
@@ -241,7 +241,7 @@ typeError (ParentTypeError offset file err) =
     ( Diagnostic.emit
         (Diagnostic.Offset offset)
         Diagnostic.Caret
-        (fromString $ "type error in parent")
+        (fromString "type error in parent")
     )
     file
     (typeError err)
@@ -251,7 +251,7 @@ typeError (IncludeParseError offset file err) =
     ( Diagnostic.emit
         (Diagnostic.Offset offset)
         Diagnostic.Caret
-        (fromString $ "parse error in included template")
+        (fromString "parse error in included template")
     )
     file
     (SingleReport $ Text.Diagnostic.Sage.parseError err)
@@ -261,10 +261,22 @@ typeError (IncludeTypeError offset file err) =
     ( Diagnostic.emit
         (Diagnostic.Offset offset)
         Diagnostic.Caret
-        (fromString $ "type error in included template")
+        (fromString "type error in included template")
     )
     file
     (typeError err)
+typeError (NotParam offset) =
+  SingleReport $
+    Diagnostic.emit
+      (Diagnostic.Offset offset)
+      Diagnostic.Caret
+      (fromString "does not satisfy a known requirement")
+typeError (ParamAlreadyBound offset) =
+  SingleReport $
+    Diagnostic.emit
+      (Diagnostic.Offset offset)
+      Diagnostic.Caret
+      (fromString "requirement has previously been satisfied")
 
 renderFields :: [(Text, Type)] -> String
 renderFields [] = "none"

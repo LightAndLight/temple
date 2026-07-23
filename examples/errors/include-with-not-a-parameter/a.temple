@@ -1,0 +1,3 @@
+before
+{% include "b.temple" with notaparam = "x" %}
+after

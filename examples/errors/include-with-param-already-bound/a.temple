@@ -1,0 +1,3 @@
+before
+{% include "b.temple" with name = "x", name = "y" %}
+after

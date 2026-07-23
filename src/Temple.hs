@@ -83,7 +83,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import qualified Data.Char as Char
-import Data.Foldable (for_, traverse_)
+import Data.Foldable (foldlM, for_, traverse_)
 import Data.Functor (void)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
@@ -131,6 +131,8 @@ data Part
   | PartInclude
       -- | File to include
       !(Located Text)
+      -- | Optional parameter bindings (@with name1 = expr1, name2 = expr2, ..., nameN = exprN@)
+      !(Maybe [(Located Text, Located Expr)])
   deriving (Show, Eq)
 
 data Located a
@@ -201,9 +203,12 @@ pragmaParser =
         openPragmaParser <* symbol (fromString "end") <* symbol (locatedValue name)
         pure $ PragmaBlock name template
     )
-      <|> PragmaWith
-        <$ symbol (fromString "with")
-        <*> commaSep ((,) <$> locatedParser identParser <* symbolic '=' <*> exprParser)
+      <|> PragmaWith <$> withParser
+
+withParser :: Parser [(Located Text, Located Expr)]
+withParser =
+  symbol (fromString "with")
+    *> commaSep ((,) <$> locatedParser identParser <* symbolic '=' <*> exprParser)
 
 noneOf :: String -> Parser Char
 noneOf cs = satisfy (`notElem` cs)
@@ -252,6 +257,7 @@ partIncludeParser =
     <$ (try (openPragmaParser <* notFollowedBy (symbol $ fromString "end")) <?> "{%")
     <* symbol (fromString "include")
     <*> locatedParser (fmap Text.pack stringLiteralParser)
+    <*> optional withParser
     <* closePragmaParser
 
 kIf, kThen, kElse, kFor, kIn, kYield, kMatch :: Text
@@ -532,6 +538,12 @@ data TypeError
       -- | File being type checked
       !FilePath
       TypeError
+  | NotParam
+      -- | Source offset of error
+      !Int
+  | ParamAlreadyBound
+      -- | Source offset of error
+      !Int
 
 data Type
   = TMeta !Int
@@ -832,7 +844,7 @@ checkPart :: MonadIO m => Part -> InferT m ()
 checkPart PartText{} = pure ()
 checkPart (PartExpr e) = checkExpr e TString
 checkPart (PartExprStream e) = checkExpr e (TStream TString)
-checkPart (PartInclude target) = do
+checkPart (PartInclude target mWith) = do
   currentFile <- asks ieCurrentFile
 
   let includePath = takeDirectory currentFile </> Text.unpack (locatedValue target)
@@ -847,10 +859,52 @@ checkPart (PartInclude target) = do
         case Sage.parse (templateParser currentFile <* Sage.eof) content of
           Left err -> throwError $ IncludeParseError (locatedOffset target) includePath err
           Right x -> pure x
-      local (\env -> env{ieCurrentFile = includePath}) $
-        checkTemplate includeTemplate
-          `catchError` (throwError . IncludeTypeError (locatedOffset target) includePath)
+
+      let
+        checkIncludeTemplate =
+          local (\env -> env{ieCurrentFile = includePath}) $
+            checkTemplate includeTemplate
+              `catchError` (throwError . IncludeTypeError (locatedOffset target) includePath)
+      case mWith of
+        Nothing -> checkIncludeTemplate
+        Just bindings -> do
+          includeRequirements <- do
+            currentRequirements <- InferT $ gets isRequirements
+            InferT . modify $ \s -> s{isRequirements = []}
+            checkIncludeTemplate
+            includeRequirements <- InferT $ gets isRequirements
+            InferT . modify $ \s -> s{isRequirements = currentRequirements}
+            pure includeRequirements
+
+          includeRequirements' <- foldlM bindRequirement includeRequirements bindings
+          for_ includeRequirements' $ \req -> do
+            unless (reqSatisfied req) $ do
+              mExisting <- lookupRequirement $ reqName req
+              case mExisting of
+                Nothing ->
+                  InferT . modify $ \s -> s{isRequirements = isRequirements s ++ [req]}
+                Just existing -> do
+                  unify (locatedOffset target) (reqType existing) (reqType req)
+                  InferT . modify $ \s ->
+                    s
+                      { isRequirements =
+                          updateRequirement
+                            existing{reqLocations = reqLocations existing <> reqLocations req}
+                            (isRequirements s)
+                      }
+
       addDependency includePath includeTemplate
+  where
+    bindRequirement reqs (name, value) =
+      case find ((locatedValue name ==) . reqName) reqs of
+        Nothing ->
+          throwError $ NotParam (locatedOffset name)
+        Just req
+          | reqSatisfied req ->
+              throwError $ ParamAlreadyBound (locatedOffset name)
+          | otherwise -> do
+              checkExpr value $ reqType req
+              pure $ modifyRequirement (locatedValue name) (\r -> r{reqSatisfied = True}) reqs
 
 instantiateTypeScheme :: Monad m => TypeScheme -> InferT m Type
 instantiateTypeScheme (Forall vars ty) = do
@@ -1436,15 +1490,24 @@ evalPart env (PartExpr e) =
   valueString $ evalExpr env (locatedValue e)
 evalPart env (PartExprStream e) =
   foldMap valueString . valueStream $ evalExpr env (locatedValue e)
-evalPart env (PartInclude file) =
+evalPart env (PartInclude file mWith) =
   let
     includePath = takeDirectory (eeCurrentFile env) </> Text.unpack (locatedValue file)
+    scope =
+      case mWith of
+        Nothing ->
+          eeScope env
+        Just bindings ->
+          Map.fromList
+            [ (locatedValue name, value) | (name, expr) <- bindings, let !value = evalExpr env (locatedValue expr)
+            ]
+            <> eeScope env
     template =
       fromMaybe (error $ "missing dependency: " ++ includePath) $
         Map.lookup includePath $
           eeDependencies env
   in
-    evalTemplate env{eeCurrentFile = includePath} template
+    evalTemplate env{eeCurrentFile = includePath, eeScope = scope} template
 
 evalExpr :: EvalEnv -> Expr -> Value
 evalExpr env (Var v) =
