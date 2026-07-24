@@ -36,6 +36,7 @@ module Temple
   , Type (..)
   , Kind (..)
   , TypeError (..)
+  , typeErrorLoc
 
     -- ** Type inference
   , Binding (..)
@@ -561,6 +562,29 @@ data TypeError loc
   | ParamAlreadyBound
       !loc
   deriving (Show)
+
+typeErrorLoc :: TypeError loc -> loc
+typeErrorLoc err =
+  case err of
+    NotInScope loc -> loc
+    TypeMismatch loc _ _ -> loc
+    UnexpectedFields loc _ -> loc
+    MissingFields loc _ -> loc
+    UnexpectedConstructors loc _ -> loc
+    MissingConstructors loc _ -> loc
+    ArityMismatch loc _ _ -> loc
+    KindMismatch loc _ _ -> loc
+    NotRequirement loc _ -> loc
+    BlockBadRequirementType loc _ -> loc
+    RequirementAlreadySatisfied loc -> loc
+    FileNotFound loc -> loc
+    ParentParseError loc _ _ -> loc
+    ParentTypeError loc _ _ -> loc
+    IncludeDisabled loc -> loc
+    IncludeParseError loc _ _ -> loc
+    IncludeTypeError loc _ _ -> loc
+    NotParam loc -> loc
+    ParamAlreadyBound loc -> loc
 
 data Type
   = TMeta !Int
