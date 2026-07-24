@@ -564,6 +564,7 @@ data TypeError
   | ParamAlreadyBound
       -- | Source offset of error
       !Int
+  deriving Show
 
 data Type
   = TMeta !Int
