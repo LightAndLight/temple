@@ -9,6 +9,7 @@ module Temple
     Template (..)
   , Part (..)
   , Pragma (..)
+  , LExpr
   , Expr (..)
   , Field (..)
   , Branch (..)
@@ -17,6 +18,7 @@ module Temple
 
     -- * Parsing
   , parse
+  , Offset (..)
   , Sage.ParseError (..)
   , templateParser
   , partParser
@@ -52,6 +54,8 @@ module Temple
   , inferExpr
   , checkExpr
   , checkPart
+  , checkPartInclude
+  , checkPartIncludeDisabled
   , zonkDefault
   , zonkNoDefault
 
@@ -115,75 +119,79 @@ import System.IO.Error (isDoesNotExistError)
 import Text.Sage (Parser, char, notFollowedBy, satisfy, sepBy, skipMany, string, try, (<?>))
 import qualified Text.Sage as Sage
 
-data Template
+data Template loc
   = TemplateBase
       -- | Template path (relative to working directory)
       !FilePath
-      [Part]
+      [Part loc]
   | TemplateChild
       -- | Template path (relative to working directory)
       !FilePath
       -- | Parent template
-      !(Located FilePath)
-      ![Pragma]
+      !(Located loc FilePath)
+      ![Pragma loc]
   deriving (Show, Eq)
 
-data Pragma
-  = PragmaBlock !(Located Text) ![Part]
-  | PragmaWith ![(Located Text, Located Expr)]
+data Pragma loc
+  = PragmaBlock !(Located loc Text) ![Part loc]
+  | PragmaWith ![(Located loc Text, LExpr loc)]
   deriving (Show, Eq)
 
-data Part
+data Part loc
   = PartText !Text
-  | PartExpr !(Located Expr)
-  | PartExprStream !(Located Expr)
+  | PartExpr !(LExpr loc)
+  | PartExprStream !(LExpr loc)
   | PartInclude
       -- | File to include
-      !(Located Text)
+      !(Located loc Text)
       -- | Optional parameter bindings (@with name1 = expr1, name2 = expr2, ..., nameN = exprN@)
-      !(Maybe [(Located Text, Located Expr)])
+      !(Maybe [(Located loc Text, LExpr loc)])
   deriving (Show, Eq)
 
-data Located a
+data Located loc a
   = Located
-  { locatedOffset :: !Int
-  , locatedValue :: !a
+  { locatedLoc :: !loc
+  , locatedVal :: !a
   }
   deriving (Show, Eq, Functor)
 
-data Expr
+type LExpr loc = Located loc (Expr loc)
+
+data Expr loc
   = Var !Text
-  | String ![Part]
-  | MultilineString ![Part]
-  | Call !(Located Text) ![Located Expr]
-  | Record [(Text, Located Expr)]
-  | Field !(Located Expr) !Field
-  | Constructor !Text [Located Expr]
-  | Match !(Located Expr) ![Branch]
-  | IfThenElse !(Located Expr) !(Located Expr) !(Located Expr)
-  | Array ![Located Expr]
+  | String ![Part loc]
+  | MultilineString ![Part loc]
+  | Call !(Located loc Text) ![LExpr loc]
+  | Record [(Text, LExpr loc)]
+  | Field !(LExpr loc) !(Field loc)
+  | Constructor !Text [LExpr loc]
+  | Match !(LExpr loc) ![Branch loc]
+  | IfThenElse !(LExpr loc) !(LExpr loc) !(LExpr loc)
+  | Array ![LExpr loc]
   | -- | @for <name> in <collection> yield <value>@
     For
       -- | @<name>@
       !Text
       -- | @<collection>@
-      !(Located Expr)
+      !(LExpr loc)
       -- | @<value>@
-      !(Located Expr)
+      !(LExpr loc)
   deriving (Show, Eq)
 
-data Field
+data Field loc
   = FStatic !Text
-  | FDynamic !(Located Expr)
+  | FDynamic !(LExpr loc)
   deriving (Show, Eq)
 
-data Branch
-  = Branch !(Located Pattern) !(Located Expr)
+data Branch loc
+  = Branch !(Located loc Pattern) !(LExpr loc)
   deriving (Show, Eq)
 
 data Pattern
   = PConstructor !Text ![Text]
   deriving (Show, Eq)
+
+newtype Offset = Offset {getOffset :: Int}
 
 parse ::
   {-| Path of file being parsed
@@ -193,10 +201,10 @@ parse ::
   FilePath ->
   -- | Input to parse
   ByteString ->
-  Either Sage.ParseError Template
+  Either Sage.ParseError (Template Offset)
 parse path = Sage.parse (templateParser path)
 
-templateParser :: FilePath -> Parser Template
+templateParser :: FilePath -> Parser (Template Offset)
 templateParser path =
   TemplateChild path <$> pragmaExtendsParser <*> many pragmaParser
     <|> TemplateBase path <$> many partParser
@@ -213,19 +221,19 @@ closePragmaParser :: Parser ()
 closePragmaParser =
   void . string $ fromString "%}"
 
-pragmaParser :: Parser Pragma
+pragmaParser :: Parser (Pragma Offset)
 pragmaParser =
   between openPragmaParser (token closePragmaParser) $
     ( do
         _ <- symbol $ fromString "block"
         name <- locatedParser identParser <* token closePragmaParser
         template <- many partParser
-        openPragmaParser <* symbol (fromString "end") <* symbol (locatedValue name)
+        openPragmaParser <* symbol (fromString "end") <* symbol (locatedVal name)
         pure $ PragmaBlock name template
     )
       <|> PragmaWith <$> withParser
 
-withParser :: Parser [(Located Text, Located Expr)]
+withParser :: Parser [(Located Offset Text, LExpr Offset)]
 withParser =
   symbol (fromString "with")
     *> commaSep ((,) <$> locatedParser identParser <* symbolic '=' <*> exprParser)
@@ -251,7 +259,7 @@ parens = between (symbolic '(') (symbolic ')')
 commaSep :: Parser a -> Parser [a]
 commaSep p = sepBy p (symbolic ',')
 
-partParser :: Parser Part
+partParser :: Parser (Part Offset)
 partParser =
   PartText . Text.pack
     <$> some
@@ -263,7 +271,7 @@ partParser =
     <|> partExprParser
     <|> partIncludeParser
 
-partExprParser :: Parser Part
+partExprParser :: Parser (Part Offset)
 partExprParser =
   ($)
     <$ symbol (fromString "{{")
@@ -271,7 +279,7 @@ partExprParser =
     <*> exprParser
     <* string (fromString "}}")
 
-partIncludeParser :: Parser Part
+partIncludeParser :: Parser (Part Offset)
 partIncludeParser =
   PartInclude
     <$ (try (openPragmaParser <* notFollowedBy (symbol $ fromString "end")) <?> "{%")
@@ -300,13 +308,13 @@ keywords =
   , kMatch
   ]
 
-locatedParser :: Parser a -> Parser (Located a)
-locatedParser p = Located <$> Sage.getOffset <*> p
+locatedParser :: Parser a -> Parser (Located Offset a)
+locatedParser p = Located <$> fmap Offset Sage.getOffset <*> p
 
-exprParser :: Parser (Located Expr)
+exprParser :: Parser (LExpr Offset)
 exprParser =
   (\offset -> foldl' (\acc item -> Located offset $ Field acc item))
-    <$> Sage.getOffset
+    <$> fmap Offset Sage.getOffset
     <*> atomParser
     <*> many (symbolic '.' *> fieldParser)
     <|> locatedParser recordParser
@@ -349,10 +357,10 @@ stringLiteralParser =
             <|> char '\\' *> (char '\\' <|> char '{' <|> char '}' <|> char '"' <|> ('\n' <$ char 'n'))
       )
 
-atomParser :: Parser (Located Expr)
+atomParser :: Parser (LExpr Offset)
 atomParser =
   locatedParser
-    ( (\name -> maybe (Var $ locatedValue name) (Call name))
+    ( (\name -> maybe (Var $ locatedVal name) (Call name))
         <$> locatedParser identParser
         <*> optional (parens $ commaSep exprParser)
         <|> (\name -> Constructor name . fromMaybe [])
@@ -393,7 +401,7 @@ atomParser =
           Nothing -> multilinePartsParser Nothing <|> pure []
           Just{} -> multilineLinesParser
 
-    multilinePartsParser :: Maybe Int -> Parser [Part]
+    multilinePartsParser :: Maybe Int -> Parser [Part Offset]
     multilinePartsParser mIndent =
       some
         ( fmap
@@ -436,12 +444,12 @@ atomParser =
           (:) (PartText $ fromString "\n")
             <$> multilineLinesParser
 
-fieldParser :: Parser Field
+fieldParser :: Parser (Field Offset)
 fieldParser =
   FStatic <$> identParser
     <|> FDynamic <$> between (symbolic '{') (symbolic '}') exprParser
 
-branchParser :: Parser Branch
+branchParser :: Parser (Branch Offset)
 branchParser =
   Branch <$ symbolic '|' <*> locatedParser patternParser <* symbol (fromString "->") <*> exprParser
 
@@ -473,98 +481,86 @@ ctorParser =
   where
     isCtorStart = Char.isUpper
 
-data TypeError
+data TypeError loc
   = NotInScope
-      -- | Source offset of error
-      !Int
+      !loc
   | TypeMismatch
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Expected
       !Type
       -- | Actual
       !Type
   | UnexpectedFields
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Actual
       ![(Text, Type)]
   | MissingFields
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Expected
       ![(Text, Type)]
   | UnexpectedConstructors
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Actual
       ![(Text, [Type])]
   | MissingConstructors
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Expected
       ![(Text, [Type])]
   | ArityMismatch
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Expected
       !Int
       -- | Actual
       !Int
   | KindMismatch
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Expected
       !Kind
       -- | Actual
       !Kind
   | NotRequirement
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Offending identifier
       !Text
   | BlockBadRequirementType
-      -- | Source offset of error
-      !Int
+      !loc
       -- | Actual requirement type
       !Type
   | RequirementAlreadySatisfied
-      -- | Source offset of error
-      !Int
+      !loc
   | FileNotFound
-      -- | Source offset filepath
-      !Int
+      !loc
   | ParentParseError
-      -- | Source offset of parent filepath
-      !Int
+      !loc
       -- | File being parsed
       !FilePath
       Sage.ParseError
   | ParentTypeError
-      -- | Source offset of error (in child)
-      !Int
+      -- | Location of error (in child)
+      !loc
       -- | Path of parent file
       !FilePath
-      TypeError
+      (TypeError loc)
+  | IncludeDisabled
+      -- | Location of include filepath
+      !loc
   | IncludeParseError
-      -- | Source offset of include filepath
-      !Int
+      -- | Location of include filepath
+      !loc
       -- | File being parsed
       !FilePath
       Sage.ParseError
   | IncludeTypeError
-      -- | Source offset of include filepath
-      !Int
+      -- | Location of include filepath
+      !loc
       -- | File being type checked
       !FilePath
-      TypeError
+      (TypeError loc)
   | NotParam
-      -- | Source offset of error
-      !Int
+      !loc
   | ParamAlreadyBound
-      -- | Source offset of error
-      !Int
-  deriving Show
+      !loc
+  deriving (Show)
 
 data Type
   = TMeta !Int
@@ -612,14 +608,14 @@ data Binding
   = Binding
   { bindingName :: !Text
   , bindingType :: !Type
-  , bindingLocations :: !(NonEmpty (FilePath, Int))
+  , bindingLocations :: !(NonEmpty (FilePath, Offset))
   }
 
 inferBindings ::
-  (MonadError TypeError m, MonadIO m) =>
+  (MonadError (TypeError Offset) m, MonadIO m) =>
   FilePath ->
-  Template ->
-  m (Map FilePath Template, [Binding])
+  Template Offset ->
+  m (Map FilePath (Template Offset), [Binding])
 inferBindings file template = do
   result <-
     runInferT (defaultInferEnv file) emptyInferState $ do
@@ -641,15 +637,17 @@ inferBindings file template = do
     Right (state, bindings) ->
       pure (isDependencies state, bindings)
   where
-    zonkDefaultBinding :: Monad m => Binding -> InferT m Binding
+    zonkDefaultBinding :: Monad m => Binding -> InferT loc m Binding
     zonkDefaultBinding binding = do
       type' <- zonkDefault $ bindingType binding
       pure binding{bindingType = type'}
 
-newtype InferT m a = InferT (ReaderT InferEnv (StateT InferState (ExceptT TypeError m)) a)
-  deriving (Functor, Applicative, Monad, MonadIO, MonadReader InferEnv, MonadError TypeError)
+newtype InferT loc m a = InferT (ReaderT InferEnv (StateT (InferState loc) (ExceptT (TypeError loc) m)) a)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadReader InferEnv, MonadError (TypeError loc))
 
-runInferT :: Monad m => InferEnv -> InferState -> InferT m a -> m (Either TypeError (InferState, a))
+runInferT ::
+  Monad m =>
+  InferEnv -> InferState loc -> InferT loc m a -> m (Either (TypeError loc) (InferState loc, a))
 runInferT e s (InferT ma) = runExceptT . fmap Tuple.swap . flip runStateT s . flip runReaderT e $ ma
 
 data InferEnv
@@ -803,11 +801,11 @@ builtins =
 defaultScope :: Map Text TypeScheme
 defaultScope = fmap snd builtins
 
-data InferState
+data InferState loc
   = InferState
   { isMetavars :: !(IntMap Metavar)
-  , isRequirements :: ![Requirement]
-  , isDependencies :: !(Map FilePath Template)
+  , isRequirements :: ![Requirement loc]
+  , isDependencies :: !(Map FilePath (Template loc))
   }
 
 data Metavar
@@ -816,11 +814,11 @@ data Metavar
   , metaSolution :: Maybe Type
   }
 
-data Requirement
+data Requirement loc
   = Requirement
   { reqName :: !Text
   , reqType :: !Type
-  , reqLocations :: NonEmpty (FilePath, Int)
+  , reqLocations :: NonEmpty (FilePath, loc)
   -- ^ Places where the binding is introduced.
   , reqSatisfied :: !Bool
   }
@@ -828,105 +826,107 @@ data Requirement
 data Kind = KType | KRow
   deriving (Show, Eq)
 
-emptyInferState :: InferState
+emptyInferState :: InferState loc
 emptyInferState = InferState{isMetavars = mempty, isRequirements = mempty, isDependencies = mempty}
 
-getRequirements :: Monad m => InferT m [Requirement]
+getRequirements :: Monad m => InferT loc m [Requirement loc]
 getRequirements = InferT $ gets isRequirements
 
-addDependency :: Monad m => FilePath -> Template -> InferT m ()
+addDependency :: Monad m => FilePath -> Template loc -> InferT loc m ()
 addDependency path template = InferT $ modify $ \s -> s{isDependencies = Map.insert path template $ isDependencies s}
 
-checkTemplate :: MonadIO m => Template -> InferT m ()
-checkTemplate (TemplateBase _file parts) = traverse_ checkPart parts
+checkTemplate :: MonadIO m => Template Offset -> InferT Offset m ()
+checkTemplate (TemplateBase _file parts) = traverse_ (checkPart checkPartInclude) parts
 checkTemplate (TemplateChild file parent pragmas) = do
-  let parentPath = takeDirectory file </> locatedValue parent
+  let parentPath = takeDirectory file </> locatedVal parent
   mContent <-
     liftIO $
       fmap Just (ByteString.readFile parentPath)
         `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
   case mContent of
-    Nothing -> throwError $ FileNotFound (locatedOffset parent)
+    Nothing -> throwError $ FileNotFound (locatedLoc parent)
     Just content -> do
       parentTemplate <-
         case Sage.parse (templateParser file <* Sage.eof) content of
-          Left err -> throwError $ ParentParseError (locatedOffset parent) parentPath err
+          Left err -> throwError $ ParentParseError (locatedLoc parent) parentPath err
           Right x -> pure x
       local (\env -> env{ieCurrentFile = parentPath}) $
         checkTemplate parentTemplate
-          `catchError` (throwError . ParentTypeError (locatedOffset parent) parentPath)
+          `catchError` (throwError . ParentTypeError (locatedLoc parent) parentPath)
       traverse_ checkPragma pragmas
       addDependency parentPath parentTemplate
 
-checkPragma :: MonadIO m => Pragma -> InferT m ()
+checkPragma :: MonadIO m => Pragma Offset -> InferT Offset m ()
 checkPragma (PragmaBlock name parts) = do
-  mReq <- lookupRequirement $ locatedValue name
+  mReq <- lookupRequirement $ locatedVal name
   case mReq of
     Nothing ->
-      throwError $ NotRequirement (locatedOffset name) (locatedValue name)
+      throwError $ NotRequirement (locatedLoc name) (locatedVal name)
     Just req -> do
       if reqSatisfied req
         then
-          throwError $ RequirementAlreadySatisfied (locatedOffset name)
+          throwError $ RequirementAlreadySatisfied (locatedLoc name)
         else do
           reqTy <- zonkDefault $ reqType req
           case reqTy of
             TString ->
-              satisfyRequirement $ locatedValue name
+              satisfyRequirement $ locatedVal name
             _ ->
-              throwError $ BlockBadRequirementType (locatedOffset name) reqTy
-  traverse_ checkPart parts
+              throwError $ BlockBadRequirementType (locatedLoc name) reqTy
+  traverse_ (checkPart checkPartInclude) parts
 checkPragma (PragmaWith vars) =
   for_ vars $ \(name, value) -> do
-    mReq <- lookupRequirement $ locatedValue name
+    mReq <- lookupRequirement $ locatedVal name
     case mReq of
       Nothing ->
-        throwError $ NotRequirement (locatedOffset name) (locatedValue name)
+        throwError $ NotRequirement (locatedLoc name) (locatedVal name)
       Just req ->
         if reqSatisfied req
           then
-            throwError $ RequirementAlreadySatisfied (locatedOffset name)
+            throwError $ RequirementAlreadySatisfied (locatedLoc name)
           else do
-            checkExpr value $ reqType req
-            satisfyRequirement $ locatedValue name
+            checkExpr checkPartInclude value $ reqType req
+            satisfyRequirement $ locatedVal name
 
-lookupRequirement :: Monad m => Text -> InferT m (Maybe Requirement)
+lookupRequirement :: Monad m => Text -> InferT loc m (Maybe (Requirement loc))
 lookupRequirement name = InferT $ gets (find ((name ==) . reqName) . isRequirements)
 
-satisfyRequirement :: Monad m => Text -> InferT m ()
+satisfyRequirement :: Monad m => Text -> InferT loc m ()
 satisfyRequirement name =
   InferT . modify $ \s ->
     s{isRequirements = modifyRequirement name (\r -> r{reqSatisfied = True}) $ isRequirements s}
 
-modifyRequirement :: Text -> (Requirement -> Requirement) -> [Requirement] -> [Requirement]
+modifyRequirement ::
+  Text -> (Requirement loc -> Requirement loc) -> [Requirement loc] -> [Requirement loc]
 modifyRequirement _name _f [] = []
 modifyRequirement name f (r : rs) = if reqName r == name then f r : rs else r : modifyRequirement name f rs
 
-checkPart :: MonadIO m => Part -> InferT m ()
-checkPart PartText{} = pure ()
-checkPart (PartExpr e) = checkExpr e TString
-checkPart (PartExprStream e) = checkExpr e (TStream TString)
-checkPart (PartInclude target mWith) = do
+checkPartInclude ::
+  MonadIO m =>
+  Located Offset Text ->
+  Maybe [(Located Offset Text, LExpr Offset)] ->
+  InferT Offset m ()
+checkPartInclude target mWith = do
   currentFile <- asks ieCurrentFile
 
-  let includePath = takeDirectory currentFile </> Text.unpack (locatedValue target)
+  let includePath = takeDirectory currentFile </> Text.unpack (locatedVal target)
   mContent <-
     liftIO $
       fmap Just (ByteString.readFile includePath)
         `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
   case mContent of
-    Nothing -> throwError $ FileNotFound (locatedOffset target)
+    Nothing -> throwError $ FileNotFound (locatedLoc target)
     Just content -> do
       includeTemplate <-
         case Sage.parse (templateParser currentFile <* Sage.eof) content of
-          Left err -> throwError $ IncludeParseError (locatedOffset target) includePath err
+          Left err -> throwError $ IncludeParseError (locatedLoc target) includePath err
           Right x -> pure x
 
       let
         checkIncludeTemplate =
           local (\env -> env{ieCurrentFile = includePath}) $
             checkTemplate includeTemplate
-              `catchError` (throwError . IncludeTypeError (locatedOffset target) includePath)
+              `catchError` (throwError . IncludeTypeError (locatedLoc target) includePath)
       case mWith of
         Nothing -> checkIncludeTemplate
         Just bindings -> do
@@ -946,7 +946,7 @@ checkPart (PartInclude target mWith) = do
                 Nothing ->
                   InferT . modify $ \s -> s{isRequirements = isRequirements s ++ [req]}
                 Just existing -> do
-                  unify (locatedOffset target) (reqType existing) (reqType req)
+                  unify (locatedLoc target) (reqType existing) (reqType req)
                   InferT . modify $ \s ->
                     s
                       { isRequirements =
@@ -958,99 +958,126 @@ checkPart (PartInclude target mWith) = do
       addDependency includePath includeTemplate
   where
     bindRequirement reqs (name, value) =
-      case find ((locatedValue name ==) . reqName) reqs of
+      case find ((locatedVal name ==) . reqName) reqs of
         Nothing ->
-          throwError $ NotParam (locatedOffset name)
+          throwError $ NotParam (locatedLoc name)
         Just req
           | reqSatisfied req ->
-              throwError $ ParamAlreadyBound (locatedOffset name)
+              throwError $ ParamAlreadyBound (locatedLoc name)
           | otherwise -> do
-              checkExpr value $ reqType req
-              pure $ modifyRequirement (locatedValue name) (\r -> r{reqSatisfied = True}) reqs
+              checkExpr checkPartInclude value $ reqType req
+              pure $ modifyRequirement (locatedVal name) (\r -> r{reqSatisfied = True}) reqs
 
-instantiateTypeScheme :: Monad m => TypeScheme -> InferT m Type
+checkPartIncludeDisabled ::
+  MonadIO m =>
+  Located loc Text ->
+  Maybe [(Located loc Text, LExpr loc)] ->
+  InferT loc m ()
+checkPartIncludeDisabled target _mWith =
+  throwError $ IncludeDisabled (locatedLoc target)
+
+checkPart ::
+  MonadIO m =>
+  {-| How to check 'PartInclude'
+
+  See: 'checkPartInclude', 'checkPartIncludeDisabled'
+  -}
+  (Located loc Text -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  Part loc ->
+  InferT loc m ()
+checkPart _fInclude PartText{} = pure ()
+checkPart fInclude (PartExpr e) = checkExpr fInclude e TString
+checkPart fInclude (PartExprStream e) = checkExpr fInclude e (TStream TString)
+checkPart fInclude (PartInclude target mWith) = fInclude target mWith
+
+instantiateTypeScheme :: Monad m => TypeScheme -> InferT loc m Type
 instantiateTypeScheme (Forall vars ty) = do
   sub <- Map.fromList <$> traverse (\var -> (,) var <$> metavar KType) vars
   pure $ subst sub ty
 
 checkExpr ::
   MonadIO m =>
-  Located Expr ->
+  (Located loc Text -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  LExpr loc ->
   Type ->
-  InferT m ()
-checkExpr (Located offset (Var v)) t = do
+  InferT loc m ()
+checkExpr _fInclude (Located offset (Var v)) t = do
   mTy <- asks (Map.lookup v . ieScope)
   ty <-
     case mTy of
       Just ty -> instantiateTypeScheme ty
       Nothing -> require offset v
   unify offset t ty
-checkExpr (Located offset (String parts)) t = do
+checkExpr fInclude (Located offset (String parts)) t = do
   unify offset t TString
-  traverse_ checkPart parts
-checkExpr (Located offset (MultilineString parts)) t = do
+  traverse_ (checkPart fInclude) parts
+checkExpr fInclude (Located offset (MultilineString parts)) t = do
   unify offset t TString
-  traverse_ checkPart parts
-checkExpr (Located offset (Call name args)) t = do
+  traverse_ (checkPart fInclude) parts
+checkExpr fInclude (Located offset (Call name args)) t = do
   argTys <- traverse (const $ metavar KType) args
-  mTy <- asks (Map.lookup (locatedValue name) . ieScope)
+  mTy <- asks (Map.lookup (locatedVal name) . ieScope)
   ty <-
     case mTy of
-      Nothing -> throwError $ NotInScope (locatedOffset name)
+      Nothing -> throwError $ NotInScope (locatedLoc name)
       Just ty -> instantiateTypeScheme ty
   unify offset (TFn argTys t) ty
   for_ (zip args argTys) $ \(arg, argTy) -> do
-    checkExpr arg argTy
-checkExpr (Located offset (Record fields)) t = do
+    checkExpr fInclude arg argTy
+checkExpr fInclude (Located offset (Record fields)) t = do
   fieldsWithTys <- traverse (\(name, e) -> (,,) name e <$> metavar KType) fields
   let actual = TRecord $ foldr (\(name, _e, ty) -> TRecordField name ty) TRowEnd fieldsWithTys
   unify offset t actual
-  traverse_ (\(_name, e, ty) -> checkExpr e ty) fieldsWithTys
-checkExpr (Located _offset (Field e f)) t =
+  traverse_ (\(_name, e, ty) -> checkExpr fInclude e ty) fieldsWithTys
+checkExpr fInclude (Located _offset (Field e f)) t =
   case f of
     FDynamic _f' ->
       error "TODO: dynamic record fields"
     FStatic f' -> do
       rest <- metavar KRow
-      checkExpr e (TRecord $ TRecordField f' t rest)
-checkExpr (Located offset (Constructor name args)) t = do
+      checkExpr fInclude e (TRecord $ TRecordField f' t rest)
+checkExpr fInclude (Located offset (Constructor name args)) t = do
   argTys <- traverse (const $ metavar KType) args
   rest <- metavar KRow
   unify offset t (TSum $ TSumConstructor name argTys rest)
   for_ (zip args argTys) $ \(arg, argTy) ->
-    checkExpr arg argTy
-checkExpr (Located _offset (Match e bs)) t = do
-  eTy <- inferExpr e
+    checkExpr fInclude arg argTy
+checkExpr fInclude (Located _offset (Match e bs)) t = do
+  eTy <- inferExpr fInclude e
   for_ bs $ \(Branch p body) -> do
     bindings <- checkPattern p eTy
-    local (\env -> env{ieScope = fmap (Forall []) bindings <> ieScope env}) $ checkExpr body t
-checkExpr (Located _offset (IfThenElse cond th el)) t = do
-  checkExpr cond TBool
-  checkExpr th t
-  checkExpr el t
-checkExpr (Located offset (Array items)) t = do
+    local (\env -> env{ieScope = fmap (Forall []) bindings <> ieScope env}) $ checkExpr fInclude body t
+checkExpr fInclude (Located _offset (IfThenElse cond th el)) t = do
+  checkExpr fInclude cond TBool
+  checkExpr fInclude th t
+  checkExpr fInclude el t
+checkExpr fInclude (Located offset (Array items)) t = do
   valueTy <- metavar KType
   unify offset t (TStream valueTy)
   for_ items $ \item -> do
-    checkExpr item valueTy
-checkExpr (Located offset (For name items value)) t = do
+    checkExpr fInclude item valueTy
+checkExpr fInclude (Located offset (For name items value)) t = do
   valueTy <- metavar KType
   unify offset t (TStream valueTy)
   itemTy <- metavar KType
-  checkExpr items (TStream itemTy)
+  checkExpr fInclude items (TStream itemTy)
   local (\env -> env{ieScope = Map.insert name (Forall [] itemTy) $ ieScope env}) $
-    checkExpr value valueTy
+    checkExpr fInclude value valueTy
 
-inferExpr :: MonadIO m => Located Expr -> InferT m Type
-inferExpr e = do
+inferExpr ::
+  MonadIO m =>
+  (Located loc Text -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  LExpr loc ->
+  InferT loc m Type
+inferExpr fInclude e = do
   t <- metavar KType
-  t <$ checkExpr e t
+  t <$ checkExpr fInclude e t
 
 checkPattern ::
   Monad m =>
-  Located Pattern ->
+  Located loc Pattern ->
   Type ->
-  InferT m (Map Text Type)
+  InferT loc m (Map Text Type)
 checkPattern (Located offset (PConstructor name args)) t = do
   argTys <- traverse (\arg -> (,) arg <$> metavar KType) args
   rest <- metavar KRow
@@ -1060,9 +1087,9 @@ checkPattern (Located offset (PConstructor name args)) t = do
 require ::
   Monad m =>
   -- | Location of variable
-  Int ->
+  loc ->
   Text ->
-  InferT m Type
+  InferT loc m Type
 require offset name = do
   currentFile <- asks ieCurrentFile
   mReq <- lookupRequirement name
@@ -1092,13 +1119,13 @@ require offset name = do
           }
       pure $ reqType req
 
-updateRequirement :: Requirement -> [Requirement] -> [Requirement]
+updateRequirement :: Requirement loc -> [Requirement loc] -> [Requirement loc]
 updateRequirement _new [] = []
 updateRequirement new (req : reqs)
   | reqName new == reqName req = new : reqs
   | otherwise = req : updateRequirement new reqs
 
-metavar :: Monad m => Kind -> InferT m Type
+metavar :: Monad m => Kind -> InferT loc m Type
 metavar kind = InferT $ do
   s <- get
   let metavars = isMetavars s
@@ -1108,17 +1135,17 @@ metavar kind = InferT $ do
 
 unify ::
   Monad m =>
-  {-| Source offset that generated the constraint.
+  {-| Location that generated the constraint.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   -- | Expected
   Type ->
   -- | Actual
   Type ->
-  InferT m ()
+  InferT loc m ()
 unify offset (TMeta m) ty = solveL offset m ty
 unify offset ty (TMeta m) = solveR offset ty m
 unify offset (TVar v) ty =
@@ -1190,15 +1217,15 @@ unify _offset TRowEnd{} _ = error "don't unify TRowEnd"
 
 unifyFields ::
   Monad m =>
-  {-| Source offset that generated the constraint.
+  {-| Location that generated the constraint.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   [(Text, Type)] ->
   [(Text, Type)] ->
-  InferT m ([(Text, Type)], [(Text, Type)])
+  InferT loc m ([(Text, Type)], [(Text, Type)])
 unifyFields offset expected actual = do
   let !remainingExpected = expected' `Map.difference` actual'
   let !remainingActual = actual' `Map.difference` expected'
@@ -1212,15 +1239,15 @@ unifyFields offset expected actual = do
 
 unifyConstructors ::
   Monad m =>
-  {-| Source offset that generated the constraint.
+  {-| Location that generated the constraint.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   [(Text, [Type])] ->
   [(Text, [Type])] ->
-  InferT m ([(Text, [Type])], [(Text, [Type])])
+  InferT loc m ([(Text, [Type])], [(Text, [Type])])
 unifyConstructors offset expected actual = do
   let !remainingExpected = expected' `Map.difference` actual'
   let !remainingActual = actual' `Map.difference` expected'
@@ -1234,7 +1261,7 @@ unifyConstructors offset expected actual = do
     expected' = Map.fromList expected
     actual' = Map.fromList actual
 
-getRecordFields :: Monad m => Type -> InferT m ([(Text, Type)], Maybe Int)
+getRecordFields :: Monad m => Type -> InferT loc m ([(Text, Type)], Maybe Int)
 getRecordFields (TRecordField name ty rest) = do
   (fields, end) <- getRecordFields rest
   pure ((name, ty) : fields, end)
@@ -1248,7 +1275,7 @@ getRecordFields (TMeta v) = do
 getRecordFields ty =
   error $ "not record field: " ++ show ty
 
-getSumConstructors :: Monad m => Type -> InferT m ([(Text, [Type])], Maybe Int)
+getSumConstructors :: Monad m => Type -> InferT loc m ([(Text, [Type])], Maybe Int)
 getSumConstructors (TSumConstructor name tys rest) = do
   (fields, end) <- getSumConstructors rest
   pure ((name, tys) : fields, end)
@@ -1262,7 +1289,7 @@ getSumConstructors (TMeta v) = do
 getSumConstructors ty =
   error $ "not sum constructor: " ++ show ty
 
-kindOf :: Monad m => Type -> InferT m Kind
+kindOf :: Monad m => Type -> InferT loc m Kind
 kindOf (TMeta v) = do
   mMeta <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mMeta of
@@ -1281,17 +1308,17 @@ kindOf TRowEnd = pure KRow
 
 solveL ::
   Monad m =>
-  {-| Source offset that generated the solution.
+  {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   -- | Expected
   Int ->
   -- | Actual
   Type ->
-  InferT m ()
+  InferT loc m ()
 solveL offset v ty' = do
   mMeta <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mMeta of
@@ -1307,17 +1334,17 @@ solveL offset v ty' = do
 
 solveR ::
   Monad m =>
-  {-| Source offset that generated the solution.
+  {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   -- | Expected
   Type ->
   -- | Actual
   Int ->
-  InferT m ()
+  InferT loc m ()
 solveR offset ty v = do
   mMeta' <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mMeta' of
@@ -1333,19 +1360,19 @@ solveR offset ty v = do
 
 solveRecordTailL ::
   Monad m =>
-  {-| Source offset that generated the solution.
+  {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   -- | Optional metavariable for the "expected" record's tail.
   Maybe Int ->
   -- | Remaining "actual" fields
   [(Text, Type)] ->
   -- | Shared tail of the unified records
   Type ->
-  InferT m ()
+  InferT loc m ()
 solveRecordTailL offset rest unmatched' final =
   case rest of
     Nothing ->
@@ -1356,19 +1383,19 @@ solveRecordTailL offset rest unmatched' final =
 
 solveRecordTailR ::
   Monad m =>
-  {-| Source offset that generated the solution.
+  {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   -- | Remaining "expected" fields
   [(Text, Type)] ->
   -- | Optional metavariable for the "actual" record's tail.
   Maybe Int ->
   -- | Shared tail of the unified records
   Type ->
-  InferT m ()
+  InferT loc m ()
 solveRecordTailR offset unmatched rest' final = do
   case rest' of
     Nothing ->
@@ -1379,19 +1406,19 @@ solveRecordTailR offset unmatched rest' final = do
 
 solveSumTailL ::
   Monad m =>
-  {-| Source offset that generated the solution.
+  {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   -- | Optional metavariable for the "expected" sum's tail.
   Maybe Int ->
   -- | Remaining "actual" constructors
   [(Text, [Type])] ->
   -- | Shared tail of the unified sums
   Type ->
-  InferT m ()
+  InferT loc m ()
 solveSumTailL offset rest unmatched' final =
   case rest of
     Nothing ->
@@ -1402,19 +1429,19 @@ solveSumTailL offset rest unmatched' final =
 
 solveSumTailR ::
   Monad m =>
-  {-| Source offset that generated the solution.
+  {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
   the user of where the type error occurred.
   -}
-  Int ->
+  loc ->
   -- | Remaining "expected" constructors
   [(Text, [Type])] ->
   -- | Optional metavariable for the "actual" sum's tail.
   Maybe Int ->
   -- | Shared tail of the unified sums
   Type ->
-  InferT m ()
+  InferT loc m ()
 solveSumTailR offset unmatched rest' final = do
   case rest' of
     Nothing ->
@@ -1426,13 +1453,13 @@ solveSumTailR offset unmatched rest' final = do
 zonkNoDefault ::
   Monad m =>
   Type ->
-  InferT m Type
+  InferT loc m Type
 zonkNoDefault = zonk False
 
 zonkDefault ::
   Monad m =>
   Type ->
-  InferT m Type
+  InferT loc m Type
 zonkDefault = zonk True
 
 zonk ::
@@ -1440,7 +1467,7 @@ zonk ::
   -- | Replace unsolved metas with default types
   Bool ->
   Type ->
-  InferT m Type
+  InferT loc m Type
 zonk def (TMeta v) = do
   mmTy <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mmTy of
@@ -1501,17 +1528,17 @@ valueFn :: Value -> [Value] -> Value
 valueFn (VFn (Fn f)) = f
 valueFn v = error $ "expected function, got " ++ show v
 
-data EvalEnv
+data EvalEnv loc
   = EvalEnv
   { eeCurrentFile :: !FilePath
-  , eeDependencies :: !(Map FilePath Template)
+  , eeDependencies :: !(Map FilePath (Template loc))
   , eeScope :: !(Map Text Value)
   }
 
 defaultEvalEnv ::
   FilePath ->
-  Map FilePath Template ->
-  EvalEnv
+  Map FilePath (Template loc) ->
+  EvalEnv loc
 defaultEvalEnv currentFile dependencies =
   EvalEnv
     { eeCurrentFile = currentFile
@@ -1523,12 +1550,12 @@ defaultEvalEnv currentFile dependencies =
 defaultCtx :: Map Text Value
 defaultCtx = fmap fst builtins
 
-evalTemplate :: EvalEnv -> Template -> LazyByteString
+evalTemplate :: EvalEnv loc -> Template loc -> LazyByteString
 evalTemplate env (TemplateBase _file parts) =
   foldMap (evalPart env) parts
 evalTemplate env (TemplateChild file parent pragmas) =
   let
-    parentPath = takeDirectory file </> locatedValue parent
+    parentPath = takeDirectory file </> locatedVal parent
     template =
       fromMaybe (error $ "missing dependency: " ++ parentPath) $
         Map.lookup parentPath (eeDependencies env)
@@ -1536,32 +1563,32 @@ evalTemplate env (TemplateChild file parent pragmas) =
   in
     evalTemplate env{eeScope = ctx' <> eeScope env} template
 
-evalPragma :: EvalEnv -> Pragma -> [(Text, Value)]
+evalPragma :: EvalEnv loc -> Pragma loc -> [(Text, Value)]
 evalPragma env (PragmaBlock name parts) =
   let
     !value = VString $! foldMap (evalPart env) parts
   in
-    [(locatedValue name, value)]
+    [(locatedVal name, value)]
 evalPragma env (PragmaWith vars) =
-  [(locatedValue name, value) | (name, expr) <- vars, let !value = evalExpr env (locatedValue expr)]
+  [(locatedVal name, value) | (name, expr) <- vars, let !value = evalExpr env (locatedVal expr)]
 
-evalPart :: EvalEnv -> Part -> LazyByteString
+evalPart :: EvalEnv loc -> Part loc -> LazyByteString
 evalPart _env (PartText t) =
   Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict t
 evalPart env (PartExpr e) =
-  valueString $ evalExpr env (locatedValue e)
+  valueString $ evalExpr env (locatedVal e)
 evalPart env (PartExprStream e) =
-  foldMap valueString . valueStream $ evalExpr env (locatedValue e)
+  foldMap valueString . valueStream $ evalExpr env (locatedVal e)
 evalPart env (PartInclude file mWith) =
   let
-    includePath = takeDirectory (eeCurrentFile env) </> Text.unpack (locatedValue file)
+    includePath = takeDirectory (eeCurrentFile env) </> Text.unpack (locatedVal file)
     scope =
       case mWith of
         Nothing ->
           eeScope env
         Just bindings ->
           Map.fromList
-            [ (locatedValue name, value) | (name, expr) <- bindings, let !value = evalExpr env (locatedValue expr)
+            [ (locatedVal name, value) | (name, expr) <- bindings, let !value = evalExpr env (locatedVal expr)
             ]
             <> eeScope env
     template =
@@ -1571,7 +1598,7 @@ evalPart env (PartInclude file mWith) =
   in
     evalTemplate env{eeCurrentFile = includePath, eeScope = scope} template
 
-evalExpr :: EvalEnv -> Expr -> Value
+evalExpr :: EvalEnv loc -> Expr loc -> Value
 evalExpr env (Var v) =
   case Map.lookup v $ eeScope env of
     Nothing -> error $ "not in scope: " ++ Text.unpack v
@@ -1582,15 +1609,15 @@ evalExpr env (MultilineString parts) =
   VString $! foldMap (evalPart env) parts
 evalExpr env (Call name args) =
   let
-    !f = valueFn $ evalExpr env (Var $ locatedValue name)
-    !args' = fmap (evalExpr env . locatedValue) args
+    !f = valueFn $ evalExpr env (Var $ locatedVal name)
+    !args' = fmap (evalExpr env . locatedVal) args
   in
     f args'
 evalExpr env (Record fields) =
-  VRecord $! Map.fromList ((fmap . fmap) (evalExpr env . locatedValue) fields)
+  VRecord $! Map.fromList ((fmap . fmap) (evalExpr env . locatedVal) fields)
 evalExpr env (Field expr field) =
   let
-    record = valueRecord $ evalExpr env (locatedValue expr)
+    record = valueRecord $ evalExpr env (locatedVal expr)
     field' =
       case field of
         FStatic f ->
@@ -1599,7 +1626,7 @@ evalExpr env (Field expr field) =
           Text.Encoding.decodeUtf8
             . LazyByteString.toStrict
             . valueString
-            $ evalExpr env (locatedValue e)
+            $ evalExpr env (locatedVal e)
   in
     case Map.lookup field' record of
       Nothing ->
@@ -1613,34 +1640,34 @@ evalExpr env (Field expr field) =
         value
 evalExpr env (Constructor name args) =
   let
-    !args' = fmap (evalExpr env . locatedValue) args
+    !args' = fmap (evalExpr env . locatedVal) args
   in
     VConstructor name args'
 evalExpr env (Match e bs) =
   let
-    v = evalExpr env (locatedValue e)
+    v = evalExpr env (locatedVal e)
     (bindings, body) =
       foldr
         ( \(Branch pattern body') rest ->
-            case match (locatedValue pattern) v of
+            case match (locatedVal pattern) v of
               Nothing -> rest
               Just bindings' -> (bindings', body')
         )
         (error "pattern match failure")
         bs
   in
-    evalExpr env{eeScope = bindings <> eeScope env} (locatedValue body)
+    evalExpr env{eeScope = bindings <> eeScope env} (locatedVal body)
 evalExpr env (IfThenElse cond t e) =
-  if valueBool $ evalExpr env (locatedValue cond)
-    then evalExpr env (locatedValue t)
-    else evalExpr env (locatedValue e)
+  if valueBool $ evalExpr env (locatedVal cond)
+    then evalExpr env (locatedVal t)
+    else evalExpr env (locatedVal e)
 evalExpr env (Array items) =
-  VStream [evalExpr env (locatedValue item) | item <- items]
+  VStream [evalExpr env (locatedVal item) | item <- items]
 evalExpr env (For name xs yield) =
   let
-    xs' = valueStream $ evalExpr env (locatedValue xs)
+    xs' = valueStream $ evalExpr env (locatedVal xs)
   in
-    VStream [evalExpr env{eeScope = Map.insert name x' $ eeScope env} (locatedValue yield) | x' <- xs']
+    VStream [evalExpr env{eeScope = Map.insert name x' $ eeScope env} (locatedVal yield) | x' <- xs']
 
 match :: Pattern -> Value -> Maybe (Map Text Value)
 match (PConstructor name args) v =

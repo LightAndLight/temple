@@ -22,13 +22,15 @@ import System.Exit (exitFailure)
 import Temple
   ( Binding (..)
   , EvalEnv (..)
-  , Expr
   , Kind (..)
+  , LExpr
   , Located (..)
+  , Offset
   , Template
   , Type (..)
   , TypeError (..)
   , checkExpr
+  , checkPartIncludeDisabled
   , defaultCtx
   , defaultEvalEnv
   , emptyInferEnv
@@ -36,6 +38,7 @@ import Temple
   , evalExpr
   , evalTemplate
   , exprParser
+  , getOffset
   , identParser
   , runInferT
   , symbolic
@@ -60,7 +63,7 @@ data Cli
 data Argument
   = Argument
   { argName :: Text
-  , argValue :: Located Expr
+  , argValue :: LExpr Offset
   }
 
 argumentParser :: Sage.Parser Argument
@@ -118,17 +121,17 @@ data MultiReport
       -- | Report for next file
       MultiReport
 
-typeError :: TypeError -> MultiReport
+typeError :: TypeError Offset -> MultiReport
 typeError (NotInScope offset) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       (fromString "not in scope")
 typeError (TypeMismatch offset expected actual) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       ( fromString $
           "expected "
@@ -139,7 +142,7 @@ typeError (TypeMismatch offset expected actual) =
 typeError (UnexpectedFields offset actual) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       ( fromString $
           "record has unexpected fields "
@@ -148,7 +151,7 @@ typeError (UnexpectedFields offset actual) =
 typeError (MissingFields offset expected) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       ( fromString $
           "record is missing fields "
@@ -157,7 +160,7 @@ typeError (MissingFields offset expected) =
 typeError (UnexpectedConstructors offset actual) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       ( fromString $
           "sum has unexpected constructors "
@@ -166,7 +169,7 @@ typeError (UnexpectedConstructors offset actual) =
 typeError (MissingConstructors offset expected) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       ( fromString $
           "sum is missing constructors "
@@ -175,7 +178,7 @@ typeError (MissingConstructors offset expected) =
 typeError (ArityMismatch offset expected actual) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       ( fromString $
           "constructor requires "
@@ -186,7 +189,7 @@ typeError (ArityMismatch offset expected actual) =
 typeError (KindMismatch offset expected actual) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       ( fromString $
           "expected kind "
@@ -197,32 +200,32 @@ typeError (KindMismatch offset expected actual) =
 typeError (NotRequirement offset _name) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       (fromString "does not satisfy a known requirement")
 typeError (RequirementAlreadySatisfied offset) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       (fromString "requirement has previously been satisfied")
 typeError (BlockBadRequirementType offset actual) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       (fromString $ "requirement of type " ++ renderType actual ++ " cannot be satisfied by a block")
 typeError (FileNotFound offset) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       (fromString "file not found")
 typeError (ParentParseError offset file err) =
   -- TODO: extend `diagnostica` to handle this sort of nesting?
   MultiReport
     ( Diagnostic.emit
-        (Diagnostic.Offset offset)
+        (Diagnostic.Offset $ getOffset offset)
         Diagnostic.Caret
         (fromString $ "parse error in parent")
     )
@@ -232,17 +235,23 @@ typeError (ParentTypeError offset file err) =
   -- TODO: extend `diagnostica` to handle this sort of nesting?
   MultiReport
     ( Diagnostic.emit
-        (Diagnostic.Offset offset)
+        (Diagnostic.Offset $ getOffset offset)
         Diagnostic.Caret
         (fromString "type error in parent")
     )
     file
     (typeError err)
+typeError (IncludeDisabled offset) =
+  SingleReport $
+    Diagnostic.emit
+      (Diagnostic.Offset $ getOffset offset)
+      Diagnostic.Caret
+      (fromString "includes are disabled")
 typeError (IncludeParseError offset file err) =
   -- TODO: extend `diagnostica` to handle this sort of nesting?
   MultiReport
     ( Diagnostic.emit
-        (Diagnostic.Offset offset)
+        (Diagnostic.Offset $ getOffset offset)
         Diagnostic.Caret
         (fromString "parse error in included template")
     )
@@ -252,7 +261,7 @@ typeError (IncludeTypeError offset file err) =
   -- TODO: extend `diagnostica` to handle this sort of nesting?
   MultiReport
     ( Diagnostic.emit
-        (Diagnostic.Offset offset)
+        (Diagnostic.Offset $ getOffset offset)
         Diagnostic.Caret
         (fromString "type error in included template")
     )
@@ -261,13 +270,13 @@ typeError (IncludeTypeError offset file err) =
 typeError (NotParam offset) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       (fromString "does not satisfy a known requirement")
 typeError (ParamAlreadyBound offset) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset offset)
+      (Diagnostic.Offset $ getOffset offset)
       Diagnostic.Caret
       (fromString "requirement has previously been satisfied")
 
@@ -337,7 +346,7 @@ displayReport file readFile' report = do
     . Diagnostic.render Diagnostic.defaultConfig (fromString file) content
     $ report
 
-parseTemplate :: FilePath -> IO Template
+parseTemplate :: FilePath -> IO (Template Offset)
 parseTemplate file = do
   input <- ByteString.readFile file
   case Sage.parse (templateParser file <* Sage.eof) input of
@@ -348,8 +357,8 @@ parseTemplate file = do
 
 inferBindings ::
   FilePath ->
-  Template ->
-  IO (Map FilePath Template, [Binding])
+  Template Offset ->
+  IO (Map FilePath (Template Offset), [Binding])
 inferBindings file template = do
   result <- runExceptT $ Temple.inferBindings file template
 
@@ -395,7 +404,8 @@ apply file args = do
           exitFailure
         Just (index, argPlain, arg) -> do
           result <-
-            runInferT (emptyInferEnv ".") emptyInferState $ checkExpr (argValue arg) (bindingType binding)
+            runInferT (emptyInferEnv ".") emptyInferState $
+              checkExpr checkPartIncludeDisabled (argValue arg) (bindingType binding)
 
           case result of
             Right (_state, ()) ->
@@ -409,7 +419,7 @@ apply file args = do
 
   scope' <-
     for scope $ \(name, expr) -> do
-      let !value = evalExpr (defaultEvalEnv "." mempty) $ locatedValue expr
+      let !value = evalExpr (defaultEvalEnv "." mempty) $ locatedVal expr
       pure (name, value)
 
   LazyByteString.putStrLn $
@@ -430,7 +440,7 @@ locate file var = do
           let
             report =
               Diagnostic.emit
-                (Diagnostic.Offset bindingOffset)
+                (Diagnostic.Offset $ getOffset bindingOffset)
                 Diagnostic.Caret
                 (fromString "variable found")
           in
