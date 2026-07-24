@@ -15,6 +15,8 @@ module Temple
   , Branch (..)
   , Pattern (..)
   , Located (..)
+  , renderType
+  , renderKind
 
     -- * Parsing
   , parse
@@ -611,6 +613,37 @@ data Type
       !Type
   | TRowEnd
   deriving (Show)
+
+renderType :: Type -> String
+renderType (TMeta v) = "?" ++ show v
+renderType (TVar v) = Text.unpack v
+renderType TBool = "Bool"
+renderType TString = "String"
+renderType (TFn args retTy) = "Fn(" ++ intercalate ", " (fmap renderType args) ++ ") -> " ++ renderType retTy
+renderType (TStream ty) = "Stream(" ++ renderType ty ++ ")"
+renderType (TRecord fields) = "{" ++ renderType fields ++ "}"
+renderType (TRecordField name ty rest) =
+  Text.unpack name
+    ++ " : "
+    ++ renderType ty
+    ++ case rest of
+      TRowEnd -> ""
+      _ -> ", " ++ renderType rest
+renderType (TSum ctors) = "Sum(" ++ renderType ctors ++ ")"
+renderType (TSumConstructor name tys rest) =
+  Text.unpack name
+    ++ ( if null tys
+           then ""
+           else "(" ++ intercalate ", " (fmap renderType tys) ++ ")"
+       )
+    ++ case rest of
+      TRowEnd -> ""
+      _ -> " | " ++ renderType rest
+renderType TRowEnd = ""
+
+renderKind :: Kind -> String
+renderKind KType = "Type"
+renderKind KRow = "Row"
 
 subst :: Map Text Type -> Type -> Type
 subst sub ty@(TVar v) =
