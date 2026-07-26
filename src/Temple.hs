@@ -117,6 +117,7 @@ import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Data.Text.Read as Text.Read
 import qualified Data.Tuple as Tuple
+import GHC.Stack (HasCallStack)
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Error (isDoesNotExistError)
 import Text.Sage (Parser, char, notFollowedBy, satisfy, sepBy, skipMany, string, try, (<?>))
@@ -1197,7 +1198,7 @@ metavar kind = InferT $ do
   pure $ TMeta n
 
 unify ::
-  Monad m =>
+  (HasCallStack, Monad m) =>
   {-| Location that generated the constraint.
 
   If unification fails with a type error, this source offset should inform
@@ -1370,7 +1371,7 @@ kindOf TSumConstructor{} = pure KRow
 kindOf TRowEnd = pure KRow
 
 solveL ::
-  Monad m =>
+  (HasCallStack, Monad m) =>
   {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
@@ -1396,7 +1397,7 @@ solveL offset v ty' = do
         Just ty -> unify offset ty ty'
 
 solveR ::
-  Monad m =>
+  (HasCallStack, Monad m) =>
   {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
@@ -1422,7 +1423,7 @@ solveR offset ty v = do
         Just ty' -> unify offset ty ty'
 
 solveRecordTailL ::
-  Monad m =>
+  (HasCallStack, Monad m) =>
   {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
@@ -1445,7 +1446,7 @@ solveRecordTailL offset rest unmatched' final =
       solveL offset v (foldr (uncurry TRecordField) final unmatched')
 
 solveRecordTailR ::
-  Monad m =>
+  (HasCallStack, Monad m) =>
   {-| Location that generated the solution.
 
   If unification fails with a type error, this source offset should inform
