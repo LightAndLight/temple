@@ -16,6 +16,7 @@ module Temple
   , Pattern (..)
   , Located (..)
   , renderType
+  , renderTypeScheme
   , renderKind
 
     -- * Parsing
@@ -59,6 +60,7 @@ module Temple
   , checkPart
   , checkPartInclude
   , checkPartIncludeDisabled
+  , instantiateTypeScheme
   , zonkDefault
   , zonkNoDefault
 
@@ -103,11 +105,12 @@ import Data.Foldable (foldlM, for_, traverse_)
 import Data.Functor (void)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
-import Data.List (find, intercalate)
+import Data.List (find, intercalate, nub)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
@@ -647,6 +650,12 @@ renderType (TSumConstructor name tys rest) =
       _ -> " | " ++ renderType rest
 renderType TRowEnd = ""
 
+renderTypeScheme :: TypeScheme -> String
+renderTypeScheme (Forall vars ty) =
+  case vars of
+    [] -> renderType ty
+    _ -> "forall " ++ unwords (fmap Text.unpack vars) ++ ". " ++ renderType ty
+
 renderKind :: Kind -> String
 renderKind KType = "Type"
 renderKind KRow = "Row"
@@ -667,10 +676,49 @@ subst sub (TSum ctors) = TSum (subst sub ctors)
 subst sub (TSumConstructor name tys rest) = TSumConstructor name (fmap (subst sub) tys) (subst sub rest)
 subst _ TRowEnd = TRowEnd
 
+substMetas :: (Int -> Type) -> Type -> Type
+substMetas f (TMeta v) = f v
+substMetas _f t@TVar{} = t
+substMetas _f TBool = TBool
+substMetas _f TString = TString
+substMetas f (TFn args retTy) = TFn (fmap (substMetas f) args) (substMetas f retTy)
+substMetas f (TStream t) = TStream (substMetas f t)
+substMetas f (TRecord fields) = TRecord (substMetas f fields)
+substMetas f (TRecordField name t rest) = TRecordField name (substMetas f t) (substMetas f rest)
+substMetas f (TSum ctors) = TSum (substMetas f ctors)
+substMetas f (TSumConstructor name tys rest) = TSumConstructor name (fmap (substMetas f) tys) (substMetas f rest)
+substMetas _f TRowEnd = TRowEnd
+
+metavarsOf :: Type -> [Int]
+metavarsOf (TMeta v) = [v]
+metavarsOf TVar{} = []
+metavarsOf TBool = []
+metavarsOf TString = []
+metavarsOf (TFn args retTy) = foldMap metavarsOf args <> metavarsOf retTy
+metavarsOf (TStream ty) = metavarsOf ty
+metavarsOf (TRecord fields) = metavarsOf fields
+metavarsOf (TRecordField _name ty rest) = metavarsOf ty <> metavarsOf rest
+metavarsOf (TSum ctors) = metavarsOf ctors
+metavarsOf (TSumConstructor _name tys rest) = foldMap metavarsOf tys <> metavarsOf rest
+metavarsOf TRowEnd = []
+
+freeTypeVars :: Type -> Set Text
+freeTypeVars TMeta{} = mempty
+freeTypeVars (TVar v) = Set.singleton v
+freeTypeVars TBool = mempty
+freeTypeVars TString = mempty
+freeTypeVars (TFn args retTy) = foldMap freeTypeVars args <> freeTypeVars retTy
+freeTypeVars (TStream ty) = freeTypeVars ty
+freeTypeVars (TRecord fields) = freeTypeVars fields
+freeTypeVars (TRecordField _name ty rest) = freeTypeVars ty <> freeTypeVars rest
+freeTypeVars (TSum ctors) = freeTypeVars ctors
+freeTypeVars (TSumConstructor _name tys rest) = foldMap freeTypeVars tys <> freeTypeVars rest
+freeTypeVars TRowEnd = mempty
+
 data Binding
   = Binding
   { bindingName :: !Text
-  , bindingType :: !Type
+  , bindingScheme :: !TypeScheme
   , bindingLocations :: !(NonEmpty (FilePath, Offset))
   }
 
@@ -685,11 +733,11 @@ inferBindings file template = do
       checkTemplate template
       requirements <- getRequirements
       traverse
-        zonkDefaultBinding
+        generaliseBinding
         ( mapMaybe
             ( \req -> do
                 guard . not $ reqSatisfied req
-                pure $ Binding (reqName req) (reqType req) (reqLocations req)
+                pure (reqName req, reqType req, reqLocations req)
             )
             requirements
         )
@@ -700,10 +748,36 @@ inferBindings file template = do
     Right (state, bindings) ->
       pure (isDependencies state, bindings)
   where
-    zonkDefaultBinding :: Monad m => Binding -> InferT loc m Binding
-    zonkDefaultBinding binding = do
-      type' <- zonkDefault $ bindingType binding
-      pure binding{bindingType = type'}
+    generaliseBinding ::
+      Monad m =>
+      (Text, Type, NonEmpty (FilePath, Offset)) ->
+      InferT loc m Binding
+    generaliseBinding (name, ty, locations) = do
+      ty' <- zonkDefault ty
+      pure $ Binding name (generalise ty') locations
+
+    varNameSupply :: [Text]
+    varNameSupply =
+      fmap Text.pack $
+        [[c] | c <- ['a' .. 'z']] ++ [c : show n | n <- [1 :: Int ..], c <- ['a' .. 'z']]
+
+    generalise :: Type -> TypeScheme
+    generalise ty =
+      Forall
+        boundVars
+        ( substMetas
+            ( \v ->
+                maybe
+                  (error $ "no name for " ++ show v ++ " in " ++ show nameFor)
+                  TVar
+                  (IntMap.lookup v nameFor)
+            )
+            ty
+        )
+      where
+        metas = nub $ metavarsOf ty
+        boundVars = take (length metas) $ filter (`Set.notMember` freeTypeVars ty) varNameSupply
+        nameFor = IntMap.fromList $ zip metas boundVars
 
 newtype InferT loc m a = InferT (ReaderT InferEnv (StateT (InferState loc) (ExceptT (TypeError loc) m)) a)
   deriving (Functor, Applicative, Monad, MonadIO, MonadReader InferEnv, MonadError (TypeError loc))

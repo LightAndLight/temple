@@ -1,0 +1,1 @@
+{{ if is-empty(items) then "empty" else name }}

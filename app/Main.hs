@@ -39,8 +39,10 @@ import Temple
   , exprParser
   , getOffset
   , identParser
+  , instantiateTypeScheme
   , renderKind
   , renderType
+  , renderTypeScheme
   , runInferT
   , symbolic
   , templateParser
@@ -346,7 +348,7 @@ type_ file = do
   for_ bindings $ \binding -> do
     Text.putStr $ bindingName binding
     putStr " : "
-    putStrLn . renderType $ bindingType binding
+    putStrLn . renderTypeScheme $ bindingScheme binding
 
 apply :: FilePath -> [String] -> IO ()
 apply file args = do
@@ -374,8 +376,9 @@ apply file args = do
           exitFailure
         Just (index, argPlain, arg) -> do
           result <-
-            runInferT (emptyInferEnv ".") emptyInferState $
-              checkExpr checkPartIncludeDisabled (argValue arg) (bindingType binding)
+            runInferT (emptyInferEnv ".") emptyInferState $ do
+              ty <- instantiateTypeScheme $ bindingScheme binding
+              checkExpr checkPartIncludeDisabled (argValue arg) ty
 
           case result of
             Right (_state, ()) ->
