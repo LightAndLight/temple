@@ -39,9 +39,11 @@ import Temple
   , exprParser
   , getOffset
   , identParser
+  , renderKind
+  , renderType
   , runInferT
   , symbolic
-  , templateParser, renderType, renderKind
+  , templateParser
   )
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
