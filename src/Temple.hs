@@ -162,6 +162,7 @@ type LExpr loc = Located loc (Expr loc)
 
 data Expr loc
   = Var !Text
+  | Bool !Bool
   | String ![Part loc]
   | MultilineString ![Part loc]
   | Call !(Located loc Text) ![LExpr loc]
@@ -291,7 +292,9 @@ partIncludeParser =
     <*> optional withParser
     <* closePragmaParser
 
-kIf, kThen, kElse, kFor, kIn, kYield, kMatch :: Text
+kTrue, kFalse, kIf, kThen, kElse, kFor, kIn, kYield, kMatch :: Text
+kTrue = fromString "true"
+kFalse = fromString "false"
 kIf = fromString "if"
 kThen = fromString "then"
 kElse = fromString "else"
@@ -366,6 +369,7 @@ atomParser =
     ( (\name -> maybe (Var $ locatedVal name) (Call name))
         <$> locatedParser identParser
         <*> optional (parens $ commaSep exprParser)
+        <|> Bool <$> (True <$ symbol kTrue <|> False <$ symbol kFalse)
         <|> (\name -> Constructor name . fromMaybe [])
           <$> ctorParser
           <*> optional (parens $ commaSep exprParser)
@@ -1065,6 +1069,8 @@ checkExpr _fInclude (Located offset (Var v)) t = do
       Just ty -> instantiateTypeScheme ty
       Nothing -> require offset v
   unify offset t ty
+checkExpr _fInclude (Located offset Bool{}) t = do
+  unify offset t TBool
 checkExpr fInclude (Located offset (String parts)) t = do
   unify offset t TString
   traverse_ (checkPart fInclude) parts
@@ -1660,6 +1666,8 @@ evalExpr env (Var v) =
   case Map.lookup v $ eeScope env of
     Nothing -> error $ "not in scope: " ++ Text.unpack v
     Just value -> value
+evalExpr _env (Bool b) =
+  if b then VTrue else VFalse
 evalExpr env (String parts) =
   VString $! foldMap (evalPart env) parts
 evalExpr env (MultilineString parts) =
