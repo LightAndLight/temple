@@ -794,6 +794,7 @@ data InferEnv
   }
 
 data TypeScheme = Forall ![Text] Type
+  deriving (Show)
 
 emptyInferEnv ::
   -- | Current file
