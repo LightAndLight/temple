@@ -197,6 +197,7 @@ data Pattern
   deriving (Show, Eq)
 
 newtype Offset = Offset {getOffset :: Int}
+  deriving (Show, Eq)
 
 parse ::
   {-| Path of file being parsed

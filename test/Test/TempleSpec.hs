@@ -4,7 +4,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.List (intercalate)
 import Data.String (fromString)
-import Temple (Expr (..), Located (..), Part (..), exprParser)
+import Temple (Expr (..), Located (..), Offset (..), Part (..), exprParser)
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Text.Sage (eof, parse)
 
@@ -26,10 +26,10 @@ spec = do
 
       parse (exprParser <* eof) input
         `shouldBe` Right
-          ( Located 0 $
+          ( Located (Offset 0) $
               String
                 [ PartText $ fromString "asdf "
-                , PartInclude (Located (ByteString.length input1) (fromString "test")) Nothing
+                , PartInclude (Located (Offset $ ByteString.length input1) (fromString "test")) Nothing
                 , PartText $ fromString " asdf"
                 ]
           )
@@ -42,7 +42,7 @@ spec = do
             ByteString.Char8.pack . unlines $
               [ qqq ++ qqq
               ]
-        parse (exprParser <* eof) input `shouldBe` Right (Located 0 $ MultilineString [])
+        parse (exprParser <* eof) input `shouldBe` Right (Located (Offset 0) $ MultilineString [])
 
       it "2" $ do
         let
@@ -51,7 +51,7 @@ spec = do
               [ qqq ++ "hello" ++ qqq
               ]
         parse (exprParser <* eof) input
-          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
+          `shouldBe` Right (Located (Offset 0) $ MultilineString [PartText $ fromString "hello"])
 
       it "3" $ do
         let
@@ -61,7 +61,7 @@ spec = do
               , qqq
               ]
         parse (exprParser <* eof) input
-          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+          `shouldBe` Right (Located (Offset 0) $ MultilineString [PartText $ fromString "hello\n"])
 
     describe "many lines" $ do
       it "1" $ do
@@ -72,7 +72,7 @@ spec = do
               , "hello" ++ qqq
               ]
         parse (exprParser <* eof) input
-          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
+          `shouldBe` Right (Located (Offset 0) $ MultilineString [PartText $ fromString "hello"])
 
       it "2" $ do
         let
@@ -83,7 +83,7 @@ spec = do
               , qqq
               ]
         parse (exprParser <* eof) input
-          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+          `shouldBe` Right (Located (Offset 0) $ MultilineString [PartText $ fromString "hello\n"])
 
       it "3" $ do
         let
@@ -93,7 +93,7 @@ spec = do
               , "  hello" ++ qqq
               ]
         parse (exprParser <* eof) input
-          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello"])
+          `shouldBe` Right (Located (Offset 0) $ MultilineString [PartText $ fromString "hello"])
 
       it "4" $ do
         let
@@ -104,7 +104,7 @@ spec = do
               , qqq
               ]
         parse (exprParser <* eof) input
-          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+          `shouldBe` Right (Located (Offset 0) $ MultilineString [PartText $ fromString "hello\n"])
 
       it "5" $ do
         let
@@ -115,7 +115,7 @@ spec = do
               , "  " ++ qqq
               ]
         parse (exprParser <* eof) input
-          `shouldBe` Right (Located 0 $ MultilineString [PartText $ fromString "hello\n"])
+          `shouldBe` Right (Located (Offset 0) $ MultilineString [PartText $ fromString "hello\n"])
 
       it "6" $ do
         let
@@ -128,7 +128,7 @@ spec = do
               ]
         parse (exprParser <* eof) input
           `shouldBe` Right
-            ( Located 0 $
+            ( Located (Offset 0) $
                 MultilineString
                   [ PartText $ fromString "a\n"
                   , PartText $ fromString "  b\n"
@@ -148,7 +148,7 @@ spec = do
               ]
         parse (exprParser <* eof) input
           `shouldBe` Right
-            ( Located 0 $
+            ( Located (Offset 0) $
                 MultilineString
                   [ PartText $ fromString "a\n"
                   , PartText $ fromString "  b\n"
@@ -176,10 +176,10 @@ spec = do
 
         parse (exprParser <* eof) input
           `shouldBe` Right
-            ( Located 0 $
+            ( Located (Offset 0) $
                 MultilineString
                   [ PartText $ fromString "a\n"
-                  , PartInclude (Located (ByteString.length input1) (fromString "test")) Nothing
+                  , PartInclude (Located (Offset $ ByteString.length input1) (fromString "test")) Nothing
                   , PartText $ fromString "\n"
                   , PartText $ fromString "c\n"
                   ]
@@ -205,10 +205,10 @@ spec = do
 
         parse (exprParser <* eof) input
           `shouldBe` Right
-            ( Located 0 $
+            ( Located (Offset 0) $
                 MultilineString
                   [ PartText $ fromString "a\n"
-                  , PartExpr $ Located (ByteString.length input1) (Var $ fromString "blah")
+                  , PartExpr $ Located (Offset $ ByteString.length input1) (Var $ fromString "blah")
                   , PartText $ fromString "\n"
                   , PartText $ fromString "c\n"
                   ]
