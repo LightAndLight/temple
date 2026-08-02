@@ -4,7 +4,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.List (intercalate)
 import Data.String (fromString)
-import Temple (Expr (..), Located (..), Offset (..), Part (..), exprParser, TemplateRef (..))
+import Temple (Expr (..), Located (..), Offset (..), Part (..), TemplateRef (..), exprParser)
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Text.Sage (eof, parse)
 

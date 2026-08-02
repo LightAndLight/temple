@@ -90,11 +90,12 @@ import Control.Applicative (empty, many, optional, some, (<|>))
 import Control.Monad (guard, unless, when)
 import Control.Monad.Error.Class (MonadError, catchError, throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
-import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Reader (ReaderT, runReaderT)
 import Control.Monad.Reader.Class (MonadReader, asks, local)
 import Control.Monad.State (StateT, runStateT)
 import Control.Monad.State.Class (get, gets, modify, put)
+import Control.Monad.Trans (MonadTrans (..))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
@@ -721,16 +722,16 @@ data Binding
   }
 
 inferBindings ::
-  (MonadError (TypeError Offset) m, MonadIO m) =>
+  MonadIO m =>
   -- | How to resolve a 'TemplateRef'
-  (TemplateRef -> IO (Maybe ByteString)) ->
+  (TemplateRef -> m (Maybe ByteString)) ->
   -- | Current template
   TemplateRef ->
   Template Offset ->
-  m (Map TemplateRef (Template Offset), [Binding])
+  ExceptT (TypeError Offset) m (Map TemplateRef (Template Offset), [Binding])
 inferBindings readTemplateRef currentTemplate template = do
   result <-
-    runInferT (defaultInferEnv readTemplateRef currentTemplate) emptyInferState $ do
+    lift . runInferT (defaultInferEnv readTemplateRef currentTemplate) emptyInferState $ do
       checkTemplate template
       requirements <- getRequirements
       traverse
@@ -780,18 +781,26 @@ inferBindings readTemplateRef currentTemplate template = do
         boundVars = take (length metas) $ filter (`Set.notMember` freeTypeVars ty) varNameSupply
         nameFor = IntMap.fromList $ zip metas boundVars
 
-newtype InferT loc m a = InferT (ReaderT InferEnv (StateT (InferState loc) (ExceptT (TypeError loc) m)) a)
-  deriving (Functor, Applicative, Monad, MonadIO, MonadReader InferEnv, MonadError (TypeError loc))
+newtype InferT loc m a
+  = InferT (ReaderT (InferEnv m) (StateT (InferState loc) (ExceptT (TypeError loc) m)) a)
+  deriving
+    (Functor, Applicative, Monad, MonadIO, MonadReader (InferEnv m), MonadError (TypeError loc))
+
+instance MonadTrans (InferT loc) where
+  lift = InferT . lift . lift . lift
 
 runInferT ::
   Monad m =>
-  InferEnv -> InferState loc -> InferT loc m a -> m (Either (TypeError loc) (InferState loc, a))
+  InferEnv m ->
+  InferState loc ->
+  InferT loc m a ->
+  m (Either (TypeError loc) (InferState loc, a))
 runInferT e s (InferT ma) = runExceptT . fmap Tuple.swap . flip runStateT s . flip runReaderT e $ ma
 
-data InferEnv
+data InferEnv m
   = InferEnv
   { ieCurrentTemplate :: !TemplateRef
-  , ieReadTemplateRef :: !(TemplateRef -> IO (Maybe ByteString))
+  , ieReadTemplateRef :: !(TemplateRef -> m (Maybe ByteString))
   , ieScope :: !(Map Text TypeScheme)
   }
 
@@ -800,19 +809,19 @@ data TypeScheme = Forall ![Text] Type
 
 emptyInferEnv ::
   -- | How to resolve a 'TemplateRef'
-  (TemplateRef -> IO (Maybe ByteString)) ->
+  (TemplateRef -> m (Maybe ByteString)) ->
   -- | Current template
   TemplateRef ->
-  InferEnv
+  InferEnv m
 emptyInferEnv readTemplateRef currentTemplate =
   InferEnv{ieReadTemplateRef = readTemplateRef, ieCurrentTemplate = currentTemplate, ieScope = mempty}
 
 defaultInferEnv ::
   -- | How to resolve a 'TemplateRef'
-  (TemplateRef -> IO (Maybe ByteString)) ->
+  (TemplateRef -> m (Maybe ByteString)) ->
   -- | Current template
   TemplateRef ->
-  InferEnv
+  InferEnv m
 defaultInferEnv readTemplateRef currentTemplate = (emptyInferEnv readTemplateRef currentTemplate){ieScope = defaultScope}
 
 builtins :: Map Text (Value, TypeScheme)
@@ -988,7 +997,7 @@ checkTemplate (TemplateBase parts) = traverse_ (checkPart checkPartInclude) part
 checkTemplate (TemplateChild parent pragmas) = do
   readTemplateRef <- asks ieReadTemplateRef
   let parentRef = locatedVal parent
-  mContent <- liftIO $ readTemplateRef parentRef
+  mContent <- lift $ readTemplateRef parentRef
   case mContent of
     Nothing -> throwError $ FileNotFound (locatedLoc parent)
     Just content -> do
@@ -1056,7 +1065,7 @@ checkPartInclude target mWith = do
   readTemplateRef <- asks ieReadTemplateRef
 
   let includeRef = locatedVal target
-  mContent <- liftIO $ readTemplateRef includeRef
+  mContent <- lift $ readTemplateRef includeRef
   case mContent of
     Nothing -> throwError $ FileNotFound (locatedLoc target)
     Just content -> do
