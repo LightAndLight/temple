@@ -7,6 +7,7 @@
 module Temple
   ( -- * Syntax
     Template (..)
+  , TemplateRef (..)
   , Part (..)
   , Pragma (..)
   , LExpr
@@ -86,7 +87,6 @@ module Temple
 where
 
 import Control.Applicative (empty, many, optional, some, (<|>))
-import Control.Exception (catch, throwIO)
 import Control.Monad (guard, unless, when)
 import Control.Monad.Error.Class (MonadError, catchError, throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
@@ -121,21 +121,24 @@ import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Data.Text.Read as Text.Read
 import qualified Data.Tuple as Tuple
 import GHC.Stack (HasCallStack)
-import System.FilePath (takeDirectory, (</>))
-import System.IO.Error (isDoesNotExistError)
 import Text.Sage (Parser, char, notFollowedBy, satisfy, sepBy, skipMany, string, try, (<?>))
 import qualified Text.Sage as Sage
 
+{-| A reference to another template.
+
+The format and meaning of a template reference is decided by the application.
+For example, the @temple@ CLI treats them as relative file paths, but other
+applications may use them as web URLs or datatabase keys.
+-}
+newtype TemplateRef = TemplateRef String
+  deriving (Show, Eq, Ord)
+
 data Template loc
   = TemplateBase
-      -- | Template path (relative to working directory)
-      !FilePath
       [Part loc]
   | TemplateChild
-      -- | Template path (relative to working directory)
-      !FilePath
       -- | Parent template
-      !(Located loc FilePath)
+      !(Located loc TemplateRef)
       ![Pragma loc]
   deriving (Show, Eq)
 
@@ -149,8 +152,8 @@ data Part loc
   | PartExpr !(LExpr loc)
   | PartExprStream !(LExpr loc)
   | PartInclude
-      -- | File to include
-      !(Located loc Text)
+      -- | Template to include
+      !(Located loc TemplateRef)
       -- | Optional parameter bindings (@with name1 = expr1, name2 = expr2, ..., nameN = exprN@)
       !(Maybe [(Located loc Text, LExpr loc)])
   deriving (Show, Eq)
@@ -203,24 +206,19 @@ newtype Offset = Offset {getOffset :: Int}
   deriving (Show, Eq)
 
 parse ::
-  {-| Path of file being parsed
-
-  Used to resolve @include@s and @extend@s.
-  -}
-  FilePath ->
   -- | Input to parse
   ByteString ->
   Either Sage.ParseError (Template Offset)
-parse path = Sage.parse (templateParser path)
+parse = Sage.parse templateParser
 
-templateParser :: FilePath -> Parser (Template Offset)
-templateParser path =
-  TemplateChild path <$> pragmaExtendsParser <*> many pragmaParser
-    <|> TemplateBase path <$> many partParser
+templateParser :: Parser (Template Offset)
+templateParser =
+  TemplateChild <$> pragmaExtendsParser <*> many pragmaParser
+    <|> TemplateBase <$> many partParser
   where
     pragmaExtendsParser =
       try (openPragmaParser *> symbol (fromString "extends"))
-        *> locatedParser stringLiteralParser
+        *> locatedParser (TemplateRef <$> stringLiteralParser)
         <* token closePragmaParser
 
 openPragmaParser :: Parser ()
@@ -293,7 +291,7 @@ partIncludeParser =
   PartInclude
     <$ (try (openPragmaParser <* notFollowedBy (symbol $ fromString "end")) <?> "{%")
     <* symbol (fromString "include")
-    <*> locatedParser (fmap Text.pack stringLiteralParser)
+    <*> locatedParser (TemplateRef <$> stringLiteralParser)
     <*> optional withParser
     <* closePragmaParser
 
@@ -544,14 +542,14 @@ data TypeError loc
       !loc
   | ParentParseError
       !loc
-      -- | File being parsed
-      !FilePath
+      -- | Template being parsed
+      !TemplateRef
       Sage.ParseError
   | ParentTypeError
       -- | Location of error (in child)
       !loc
-      -- | Path of parent file
-      !FilePath
+      -- | Template being type checked
+      !TemplateRef
       (TypeError loc)
   | IncludeDisabled
       -- | Location of include filepath
@@ -559,14 +557,14 @@ data TypeError loc
   | IncludeParseError
       -- | Location of include filepath
       !loc
-      -- | File being parsed
-      !FilePath
+      -- | Template being parsed
+      !TemplateRef
       Sage.ParseError
   | IncludeTypeError
       -- | Location of include filepath
       !loc
       -- | File being type checked
-      !FilePath
+      !TemplateRef
       (TypeError loc)
   | NotParam
       !loc
@@ -719,17 +717,20 @@ data Binding
   = Binding
   { bindingName :: !Text
   , bindingScheme :: !TypeScheme
-  , bindingLocations :: !(NonEmpty (FilePath, Offset))
+  , bindingLocations :: !(NonEmpty (TemplateRef, Offset))
   }
 
 inferBindings ::
   (MonadError (TypeError Offset) m, MonadIO m) =>
-  FilePath ->
+  -- | How to resolve a 'TemplateRef'
+  (TemplateRef -> IO (Maybe ByteString)) ->
+  -- | Current template
+  TemplateRef ->
   Template Offset ->
-  m (Map FilePath (Template Offset), [Binding])
-inferBindings file template = do
+  m (Map TemplateRef (Template Offset), [Binding])
+inferBindings readTemplateRef currentTemplate template = do
   result <-
-    runInferT (defaultInferEnv file) emptyInferState $ do
+    runInferT (defaultInferEnv readTemplateRef currentTemplate) emptyInferState $ do
       checkTemplate template
       requirements <- getRequirements
       traverse
@@ -750,7 +751,7 @@ inferBindings file template = do
   where
     generaliseBinding ::
       Monad m =>
-      (Text, Type, NonEmpty (FilePath, Offset)) ->
+      (Text, Type, NonEmpty (TemplateRef, Offset)) ->
       InferT loc m Binding
     generaliseBinding (name, ty, locations) = do
       ty' <- zonkDefault ty
@@ -789,7 +790,8 @@ runInferT e s (InferT ma) = runExceptT . fmap Tuple.swap . flip runStateT s . fl
 
 data InferEnv
   = InferEnv
-  { ieCurrentFile :: !FilePath
+  { ieCurrentTemplate :: !TemplateRef
+  , ieReadTemplateRef :: !(TemplateRef -> IO (Maybe ByteString))
   , ieScope :: !(Map Text TypeScheme)
   }
 
@@ -797,13 +799,21 @@ data TypeScheme = Forall ![Text] Type
   deriving (Show)
 
 emptyInferEnv ::
-  -- | Current file
-  FilePath ->
+  -- | How to resolve a 'TemplateRef'
+  (TemplateRef -> IO (Maybe ByteString)) ->
+  -- | Current template
+  TemplateRef ->
   InferEnv
-emptyInferEnv currentFile = InferEnv{ieCurrentFile = currentFile, ieScope = mempty}
+emptyInferEnv readTemplateRef currentTemplate =
+  InferEnv{ieReadTemplateRef = readTemplateRef, ieCurrentTemplate = currentTemplate, ieScope = mempty}
 
-defaultInferEnv :: FilePath -> InferEnv
-defaultInferEnv currentFile = (emptyInferEnv currentFile){ieScope = defaultScope}
+defaultInferEnv ::
+  -- | How to resolve a 'TemplateRef'
+  (TemplateRef -> IO (Maybe ByteString)) ->
+  -- | Current template
+  TemplateRef ->
+  InferEnv
+defaultInferEnv readTemplateRef currentTemplate = (emptyInferEnv readTemplateRef currentTemplate){ieScope = defaultScope}
 
 builtins :: Map Text (Value, TypeScheme)
 builtins =
@@ -943,7 +953,7 @@ data InferState loc
   = InferState
   { isMetavars :: !(IntMap Metavar)
   , isRequirements :: ![Requirement loc]
-  , isDependencies :: !(Map FilePath (Template loc))
+  , isDependencies :: !(Map TemplateRef (Template loc))
   }
 
 data Metavar
@@ -956,7 +966,7 @@ data Requirement loc
   = Requirement
   { reqName :: !Text
   , reqType :: !Type
-  , reqLocations :: NonEmpty (FilePath, loc)
+  , reqLocations :: NonEmpty (TemplateRef, loc)
   -- ^ Places where the binding is introduced.
   , reqSatisfied :: !Bool
   }
@@ -970,29 +980,27 @@ emptyInferState = InferState{isMetavars = mempty, isRequirements = mempty, isDep
 getRequirements :: Monad m => InferT loc m [Requirement loc]
 getRequirements = InferT $ gets isRequirements
 
-addDependency :: Monad m => FilePath -> Template loc -> InferT loc m ()
-addDependency path template = InferT $ modify $ \s -> s{isDependencies = Map.insert path template $ isDependencies s}
+addDependency :: Monad m => TemplateRef -> Template loc -> InferT loc m ()
+addDependency ref template = InferT $ modify $ \s -> s{isDependencies = Map.insert ref template $ isDependencies s}
 
 checkTemplate :: MonadIO m => Template Offset -> InferT Offset m ()
-checkTemplate (TemplateBase _file parts) = traverse_ (checkPart checkPartInclude) parts
-checkTemplate (TemplateChild file parent pragmas) = do
-  let parentPath = takeDirectory file </> locatedVal parent
-  mContent <-
-    liftIO $
-      fmap Just (ByteString.readFile parentPath)
-        `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
+checkTemplate (TemplateBase parts) = traverse_ (checkPart checkPartInclude) parts
+checkTemplate (TemplateChild parent pragmas) = do
+  readTemplateRef <- asks ieReadTemplateRef
+  let parentRef = locatedVal parent
+  mContent <- liftIO $ readTemplateRef parentRef
   case mContent of
     Nothing -> throwError $ FileNotFound (locatedLoc parent)
     Just content -> do
       parentTemplate <-
-        case Sage.parse (templateParser file <* Sage.eof) content of
-          Left err -> throwError $ ParentParseError (locatedLoc parent) parentPath err
+        case Sage.parse (templateParser <* Sage.eof) content of
+          Left err -> throwError $ ParentParseError (locatedLoc parent) parentRef err
           Right x -> pure x
-      local (\env -> env{ieCurrentFile = parentPath}) $
+      local (\env -> env{ieCurrentTemplate = parentRef}) $
         checkTemplate parentTemplate
-          `catchError` (throwError . ParentTypeError (locatedLoc parent) parentPath)
+          `catchError` (throwError . ParentTypeError (locatedLoc parent) parentRef)
       traverse_ checkPragma pragmas
-      addDependency parentPath parentTemplate
+      addDependency parentRef parentTemplate
 
 checkPragma :: MonadIO m => Pragma Offset -> InferT Offset m ()
 checkPragma (PragmaBlock name parts) = do
@@ -1041,30 +1049,27 @@ modifyRequirement name f (r : rs) = if reqName r == name then f r : rs else r : 
 
 checkPartInclude ::
   MonadIO m =>
-  Located Offset Text ->
+  Located Offset TemplateRef ->
   Maybe [(Located Offset Text, LExpr Offset)] ->
   InferT Offset m ()
 checkPartInclude target mWith = do
-  currentFile <- asks ieCurrentFile
+  readTemplateRef <- asks ieReadTemplateRef
 
-  let includePath = takeDirectory currentFile </> Text.unpack (locatedVal target)
-  mContent <-
-    liftIO $
-      fmap Just (ByteString.readFile includePath)
-        `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
+  let includeRef = locatedVal target
+  mContent <- liftIO $ readTemplateRef includeRef
   case mContent of
     Nothing -> throwError $ FileNotFound (locatedLoc target)
     Just content -> do
       includeTemplate <-
-        case Sage.parse (templateParser currentFile <* Sage.eof) content of
-          Left err -> throwError $ IncludeParseError (locatedLoc target) includePath err
+        case Sage.parse (templateParser <* Sage.eof) content of
+          Left err -> throwError $ IncludeParseError (locatedLoc target) includeRef err
           Right x -> pure x
 
       let
         checkIncludeTemplate =
-          local (\env -> env{ieCurrentFile = includePath}) $
+          local (\env -> env{ieCurrentTemplate = includeRef}) $
             checkTemplate includeTemplate
-              `catchError` (throwError . IncludeTypeError (locatedLoc target) includePath)
+              `catchError` (throwError . IncludeTypeError (locatedLoc target) includeRef)
       case mWith of
         Nothing -> checkIncludeTemplate
         Just bindings -> do
@@ -1093,7 +1098,7 @@ checkPartInclude target mWith = do
                             (isRequirements s)
                       }
 
-      addDependency includePath includeTemplate
+      addDependency includeRef includeTemplate
   where
     bindRequirement reqs (name, value) =
       case find ((locatedVal name ==) . reqName) reqs of
@@ -1108,7 +1113,7 @@ checkPartInclude target mWith = do
 
 checkPartIncludeDisabled ::
   MonadIO m =>
-  Located loc Text ->
+  Located loc TemplateRef ->
   Maybe [(Located loc Text, LExpr loc)] ->
   InferT loc m ()
 checkPartIncludeDisabled target _mWith =
@@ -1120,7 +1125,7 @@ checkPart ::
 
   See: 'checkPartInclude', 'checkPartIncludeDisabled'
   -}
-  (Located loc Text -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  (Located loc TemplateRef -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
   Part loc ->
   InferT loc m ()
 checkPart _fInclude PartText{} = pure ()
@@ -1135,7 +1140,7 @@ instantiateTypeScheme (Forall vars ty) = do
 
 checkExpr ::
   MonadIO m =>
-  (Located loc Text -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  (Located loc TemplateRef -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
   LExpr loc ->
   Type ->
   InferT loc m ()
@@ -1206,7 +1211,7 @@ checkExpr fInclude (Located offset (For name items value)) t = do
 
 inferExpr ::
   MonadIO m =>
-  (Located loc Text -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  (Located loc TemplateRef -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
   LExpr loc ->
   InferT loc m Type
 inferExpr fInclude e = do
@@ -1231,7 +1236,7 @@ require ::
   Text ->
   InferT loc m Type
 require offset name = do
-  currentFile <- asks ieCurrentFile
+  currentTemplate <- asks ieCurrentTemplate
   mReq <- lookupRequirement name
   case mReq of
     Nothing -> do
@@ -1243,7 +1248,7 @@ require offset name = do
                 ++ [ Requirement
                        { reqName = name
                        , reqType = ty
-                       , reqLocations = pure (currentFile, offset)
+                       , reqLocations = pure (currentTemplate, offset)
                        , reqSatisfied = False
                        }
                    ]
@@ -1254,7 +1259,7 @@ require offset name = do
         s
           { isRequirements =
               updateRequirement
-                req{reqLocations = reqLocations req <> pure (currentFile, offset)}
+                req{reqLocations = reqLocations req <> pure (currentTemplate, offset)}
                 (isRequirements s)
           }
       pure $ reqType req
@@ -1670,18 +1675,18 @@ valueFn v = error $ "expected function, got " ++ show v
 
 data EvalEnv loc
   = EvalEnv
-  { eeCurrentFile :: !FilePath
-  , eeDependencies :: !(Map FilePath (Template loc))
+  { eeCurrentTemplate :: !TemplateRef
+  , eeDependencies :: !(Map TemplateRef (Template loc))
   , eeScope :: !(Map Text Value)
   }
 
 defaultEvalEnv ::
-  FilePath ->
-  Map FilePath (Template loc) ->
+  TemplateRef ->
+  Map TemplateRef (Template loc) ->
   EvalEnv loc
-defaultEvalEnv currentFile dependencies =
+defaultEvalEnv currentTemplate dependencies =
   EvalEnv
-    { eeCurrentFile = currentFile
+    { eeCurrentTemplate = currentTemplate
     , eeDependencies = dependencies
     , eeScope = defaultCtx
     }
@@ -1691,17 +1696,17 @@ defaultCtx :: Map Text Value
 defaultCtx = fmap fst builtins
 
 evalTemplate :: EvalEnv loc -> Template loc -> LazyByteString
-evalTemplate env (TemplateBase _file parts) =
+evalTemplate env (TemplateBase parts) =
   foldMap (evalPart env) parts
-evalTemplate env (TemplateChild file parent pragmas) =
+evalTemplate env (TemplateChild parent pragmas) =
   let
-    parentPath = takeDirectory file </> locatedVal parent
+    parentRef = locatedVal parent
     template =
-      fromMaybe (error $ "missing dependency: " ++ parentPath) $
-        Map.lookup parentPath (eeDependencies env)
+      fromMaybe (error $ "missing dependency: " ++ show parentRef) $
+        Map.lookup parentRef (eeDependencies env)
     !ctx' = Map.fromList $ foldMap (evalPragma env) pragmas
   in
-    evalTemplate env{eeScope = ctx' <> eeScope env} template
+    evalTemplate env{eeCurrentTemplate = parentRef, eeScope = ctx' <> eeScope env} template
 
 evalPragma :: EvalEnv loc -> Pragma loc -> [(Text, Value)]
 evalPragma env (PragmaBlock name parts) =
@@ -1719,9 +1724,9 @@ evalPart env (PartExpr e) =
   valueString $ evalExpr env (locatedVal e)
 evalPart env (PartExprStream e) =
   foldMap valueString . valueStream $ evalExpr env (locatedVal e)
-evalPart env (PartInclude file mWith) =
+evalPart env (PartInclude ref mWith) =
   let
-    includePath = takeDirectory (eeCurrentFile env) </> Text.unpack (locatedVal file)
+    includeRef = locatedVal ref
     scope =
       case mWith of
         Nothing ->
@@ -1732,11 +1737,11 @@ evalPart env (PartInclude file mWith) =
             ]
             <> eeScope env
     template =
-      fromMaybe (error $ "missing dependency: " ++ includePath) $
-        Map.lookup includePath $
+      fromMaybe (error $ "missing dependency: " ++ show includeRef) $
+        Map.lookup includeRef $
           eeDependencies env
   in
-    evalTemplate env{eeCurrentFile = includePath, eeScope = scope} template
+    evalTemplate env{eeCurrentTemplate = includeRef, eeScope = scope} template
 
 evalExpr :: EvalEnv loc -> Expr loc -> Value
 evalExpr env (Var v) =

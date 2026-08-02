@@ -35,6 +35,7 @@ executable temple
         containers,
         diagnostica,
         diagnostica-sage,
+        filepath,
         mtl,
         optparse-applicative,
         sage,

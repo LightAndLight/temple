@@ -4,7 +4,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.List (intercalate)
 import Data.String (fromString)
-import Temple (Expr (..), Located (..), Offset (..), Part (..), exprParser)
+import Temple (Expr (..), Located (..), Offset (..), Part (..), exprParser, TemplateRef (..))
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Text.Sage (eof, parse)
 
@@ -29,7 +29,7 @@ spec = do
           ( Located (Offset 0) $
               String
                 [ PartText $ fromString "asdf "
-                , PartInclude (Located (Offset $ ByteString.length input1) (fromString "test")) Nothing
+                , PartInclude (Located (Offset $ ByteString.length input1) (TemplateRef "test")) Nothing
                 , PartText $ fromString " asdf"
                 ]
           )
@@ -179,7 +179,7 @@ spec = do
             ( Located (Offset 0) $
                 MultilineString
                   [ PartText $ fromString "a\n"
-                  , PartInclude (Located (Offset $ ByteString.length input1) (fromString "test")) Nothing
+                  , PartInclude (Located (Offset $ ByteString.length input1) (TemplateRef "test")) Nothing
                   , PartText $ fromString "\n"
                   , PartText $ fromString "c\n"
                   ]

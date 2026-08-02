@@ -3,7 +3,9 @@
 module Main (main) where
 
 import Control.Applicative (many, (<**>))
+import Control.Exception (catch, throwIO)
 import Control.Monad.Except (runExceptT)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
@@ -19,6 +21,8 @@ import qualified Data.Text.IO as Text
 import Data.Traversable (for)
 import qualified Options.Applicative as Options
 import System.Exit (exitFailure)
+import System.FilePath (splitFileName, takeDirectory, (</>))
+import System.IO.Error (isDoesNotExistError)
 import Temple
   ( Binding (..)
   , EvalEnv (..)
@@ -26,6 +30,7 @@ import Temple
   , Located (..)
   , Offset
   , Template
+  , TemplateRef (..)
   , Type (..)
   , TypeError (..)
   , checkExpr
@@ -119,9 +124,9 @@ data MultiReport
   = SingleReport Diagnostic.Report
   | MultiReport
       !Diagnostic.Report
-      -- | Next file
-      !FilePath
-      -- | Report for next file
+      -- | Next template
+      !TemplateRef
+      -- | Report for next template
       MultiReport
 
 typeError :: TypeError Offset -> MultiReport
@@ -301,42 +306,63 @@ renderConstructors xs =
       xs
 
 displayMultiReport ::
-  FilePath ->
-  -- | Read a file
-  (FilePath -> IO LazyByteString) ->
+  -- | Render a 'TemplateRef'
+  (TemplateRef -> String) ->
+  -- | Resolve a 'TemplateRef'
+  (TemplateRef -> IO LazyByteString) ->
+  TemplateRef ->
   MultiReport ->
   IO ()
-displayMultiReport file readFile' (SingleReport report) = displayReport file readFile' report
-displayMultiReport file readFile' (MultiReport report nextFile nextReport) = do
-  displayReport file readFile' report
-  displayMultiReport nextFile readFile' nextReport
+displayMultiReport renderTemplateRef readTemplateRef ref (SingleReport report) = displayReport renderTemplateRef readTemplateRef ref report
+displayMultiReport renderTemplateRef readTemplateRef ref (MultiReport report nextRef nextReport) = do
+  displayReport renderTemplateRef readTemplateRef ref report
+  displayMultiReport renderTemplateRef readTemplateRef nextRef nextReport
 
-displayReport :: FilePath -> (FilePath -> IO LazyByteString) -> Diagnostic.Report -> IO ()
-displayReport file readFile' report = do
-  content <- readFile' file
+displayReport ::
+  -- | Render a 'TemplateRef'
+  (TemplateRef -> String) ->
+  -- | Resolve a 'TemplateRef'
+  (TemplateRef -> IO LazyByteString) ->
+  TemplateRef ->
+  Diagnostic.Report ->
+  IO ()
+displayReport renderTemplateRef readTemplateRef ref report = do
+  content <- readTemplateRef ref
   LazyByteString.putStrLn
-    . Diagnostic.render Diagnostic.defaultConfig (fromString file) content
+    . Diagnostic.render Diagnostic.defaultConfig (fromString $ renderTemplateRef ref) content
     $ report
 
 parseTemplate :: FilePath -> IO (Template Offset)
 parseTemplate file = do
   input <- ByteString.readFile file
-  case Sage.parse (templateParser file <* Sage.eof) input of
+  case Sage.parse (templateParser <* Sage.eof) input of
     Left err -> do
-      displayReport file LazyByteString.readFile $ Text.Diagnostic.Sage.parseError err
+      let (base, name) = splitFileName file
+      let renderTemplateRef (TemplateRef ref) = base </> ref
+      let readTemplateRef (TemplateRef ref) = LazyByteString.readFile $ base </> ref
+      displayReport renderTemplateRef readTemplateRef (TemplateRef name) $
+        Text.Diagnostic.Sage.parseError err
       exitFailure
     Right x -> pure x
+
+loadTemplateRef :: FilePath -> TemplateRef -> IO (Maybe ByteString)
+loadTemplateRef base (TemplateRef ref) =
+  fmap Just (ByteString.readFile $ base </> ref)
+    `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
 
 inferBindings ::
   FilePath ->
   Template Offset ->
-  IO (Map FilePath (Template Offset), [Binding])
+  IO (Map TemplateRef (Template Offset), [Binding])
 inferBindings file template = do
-  result <- runExceptT $ Temple.inferBindings file template
+  let (base, name) = splitFileName file
+  result <- runExceptT $ Temple.inferBindings (loadTemplateRef base) (TemplateRef name) template
 
   case result of
     Left err -> do
-      displayMultiReport file LazyByteString.readFile $ typeError err
+      let renderTemplateRef (TemplateRef ref) = base </> ref
+      let readTemplateRef (TemplateRef ref) = LazyByteString.readFile $ base </> ref
+      displayMultiReport renderTemplateRef readTemplateRef (TemplateRef name) $ typeError err
       exitFailure
     Right x ->
       pure x
@@ -376,7 +402,7 @@ apply file args = do
           exitFailure
         Just (index, argPlain, arg) -> do
           result <-
-            runInferT (emptyInferEnv ".") emptyInferState $ do
+            runInferT (emptyInferEnv (const $ pure Nothing) (TemplateRef ".")) emptyInferState $ do
               ty <- instantiateTypeScheme $ bindingScheme binding
               checkExpr checkPartIncludeDisabled (argValue arg) ty
 
@@ -384,19 +410,25 @@ apply file args = do
             Right (_state, ()) ->
               pure (bindingName binding, argValue arg)
             Left err -> do
+              let renderTemplateRef ref = error $ "impossible template reference: " ++ show ref ++ "(includes are disabled)"
+              let readTemplateRef (TemplateRef _ref) = pure $ fromString argPlain
               displayMultiReport
-                (fromString $ "(argument " ++ show index ++ ")")
-                (const . pure $ fromString argPlain)
+                renderTemplateRef
+                readTemplateRef
+                (TemplateRef $ "(argument " ++ show index ++ ")")
                 (typeError err)
               exitFailure
 
   scope' <-
     for scope $ \(name, expr) -> do
-      let !value = evalExpr (defaultEvalEnv "." mempty) $ locatedVal expr
+      let !value = evalExpr (defaultEvalEnv (TemplateRef ".") mempty) $ locatedVal expr
       pure (name, value)
 
+  let (_base, name) = splitFileName file
   LazyByteString.putStrLn $
-    evalTemplate (defaultEvalEnv file deps){eeScope = Map.fromList scope' <> defaultCtx} template
+    evalTemplate
+      (defaultEvalEnv (TemplateRef name) deps){eeScope = Map.fromList scope' <> defaultCtx}
+      template
 
 locate :: FilePath -> String -> IO ()
 locate file var = do
@@ -432,4 +464,7 @@ locate file var = do
             (bindingFile, bindingOffset) :| rest ->
               makeReports bindingFile bindingOffset rest
 
-      displayMultiReport reportsFile LazyByteString.readFile reports
+      let base = takeDirectory file
+      let renderTemplateRef (TemplateRef ref) = base </> ref
+      let readTemplateRef (TemplateRef ref) = LazyByteString.readFile $ base </> ref
+      displayMultiReport renderTemplateRef readTemplateRef reportsFile reports
