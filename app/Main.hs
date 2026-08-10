@@ -27,11 +27,12 @@ import Temple
   ( Binding (..)
   , EvalEnv (..)
   , LExpr
+  , LText
+  , LType
   , Located (..)
-  , Offset
+  , Offset (..)
   , Template
   , TemplateRef (..)
-  , Type (..)
   , TypeError (..)
   , checkExpr
   , checkPartIncludeDisabled
@@ -288,20 +289,22 @@ typeError (ParamAlreadyBound offset) =
       Diagnostic.Caret
       (fromString "requirement has previously been satisfied")
 
-renderFields :: [(Text, Type)] -> String
+renderFields :: [(LText loc, LType loc)] -> String
 renderFields [] = "none"
-renderFields xs = intercalate ", " $ fmap (\(name, ty) -> Text.unpack name ++ " : " ++ renderType ty) xs
+renderFields xs =
+  intercalate ", " $
+    fmap (\(name, ty) -> Text.unpack (locatedVal name) ++ " : " ++ renderType (locatedVal ty)) xs
 
-renderConstructors :: [(Text, [Type])] -> String
+renderConstructors :: [(LText loc, [LType loc])] -> String
 renderConstructors [] = "none"
 renderConstructors xs =
   intercalate " | " $
     fmap
       ( \(name, tys) ->
-          Text.unpack name
+          Text.unpack (locatedVal name)
             ++ if null tys
               then ""
-              else "(" ++ intercalate ", " (fmap renderType tys) ++ ")"
+              else "(" ++ intercalate ", " (fmap (renderType . locatedVal) tys) ++ ")"
       )
       xs
 

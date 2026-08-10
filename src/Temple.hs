@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
@@ -11,6 +12,8 @@ module Temple
   , Part (..)
   , Pragma (..)
   , LExpr
+  , LType
+  , LText
   , Expr (..)
   , Field (..)
   , Branch (..)
@@ -97,6 +100,7 @@ import Control.Monad.Reader.Class (MonadReader, asks, local)
 import Control.Monad.State (StateT, runStateT)
 import Control.Monad.State.Class (get, gets, modify, put)
 import Control.Monad.Trans (MonadTrans (..))
+import Data.Bifunctor (bimap, first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
@@ -145,8 +149,8 @@ data Template loc
   deriving (Show, Eq)
 
 data Pragma loc
-  = PragmaBlock !(Located loc Text) ![Part loc]
-  | PragmaWith ![(Located loc Text, LExpr loc)]
+  = PragmaBlock !(LText loc) ![Part loc]
+  | PragmaWith ![(LText loc, LExpr loc)]
   deriving (Show, Eq)
 
 data Part loc
@@ -157,7 +161,7 @@ data Part loc
       -- | Template to include
       !(Located loc TemplateRef)
       -- | Optional parameter bindings (@with name1 = expr1, name2 = expr2, ..., nameN = exprN@)
-      !(Maybe [(Located loc Text, LExpr loc)])
+      !(Maybe [(LText loc, LExpr loc)])
   deriving (Show, Eq)
 
 data Located loc a
@@ -165,26 +169,28 @@ data Located loc a
   { locatedLoc :: !loc
   , locatedVal :: !a
   }
-  deriving (Show, Eq, Functor)
+  deriving (Show, Eq, Functor, Foldable, Traversable)
 
 type LExpr loc = Located loc (Expr loc)
+type LType loc = Located loc (Type loc)
+type LText loc = Located loc Text
 
 data Expr loc
   = Var !Text
   | Bool !Bool
   | String ![Part loc]
   | MultilineString ![Part loc]
-  | Call !(Located loc Text) ![LExpr loc]
-  | Record [(Text, LExpr loc)]
+  | Call !(LText loc) ![LExpr loc]
+  | Record [(LText loc, LExpr loc)]
   | Field !(LExpr loc) !(Field loc)
-  | Constructor !Text [LExpr loc]
+  | Constructor !(LText loc) [LExpr loc]
   | Match !(LExpr loc) ![Branch loc]
   | IfThenElse !(LExpr loc) !(LExpr loc) !(LExpr loc)
   | Array ![LExpr loc]
   | -- | @for <name> in <collection> yield <value>@
     For
       -- | @<name>@
-      !Text
+      !(LText loc)
       -- | @<collection>@
       !(LExpr loc)
       -- | @<value>@
@@ -192,16 +198,16 @@ data Expr loc
   deriving (Show, Eq)
 
 data Field loc
-  = FStatic !Text
+  = FStatic !(LText loc)
   | FDynamic !(LExpr loc)
   deriving (Show, Eq)
 
 data Branch loc
-  = Branch !(Located loc Pattern) !(LExpr loc)
+  = Branch !(Located loc (Pattern loc)) !(LExpr loc)
   deriving (Show, Eq)
 
-data Pattern
-  = PConstructor !Text ![Text]
+data Pattern loc
+  = PConstructor !(LText loc) ![LText loc]
   deriving (Show, Eq)
 
 newtype Offset = Offset {getOffset :: Int}
@@ -328,18 +334,10 @@ exprParser =
     <$> fmap Offset Sage.getOffset
     <*> atomParser
     <*> many (symbolic '.' *> fieldParser)
-    <|> locatedParser recordParser
     <|> locatedParser matchParser
     <|> locatedParser ifThenElseParser
     <|> locatedParser forParser
   where
-    recordParser =
-      Record
-        <$> between
-          (symbolic '{')
-          (symbolic '}')
-          (commaSep $ (,) <$> identParser <* symbolic '=' <*> exprParser)
-
     matchParser =
       Match <$ symbol kMatch <*> exprParser <*> many branchParser
 
@@ -353,7 +351,13 @@ exprParser =
         <*> exprParser
 
     forParser =
-      For <$ symbol kFor <*> identParser <* symbol kIn <*> exprParser <* symbol kYield <*> exprParser
+      For
+        <$ symbol kFor
+        <*> locatedParser identParser
+        <* symbol kIn
+        <*> exprParser
+        <* symbol kYield
+        <*> exprParser
 
 stringLiteralParser :: Parser String
 stringLiteralParser =
@@ -376,11 +380,12 @@ atomParser =
         <*> optional (parens $ commaSep exprParser)
         <|> Bool <$> (True <$ symbol kTrue <|> False <$ symbol kFalse)
         <|> (\name -> Constructor name . fromMaybe [])
-          <$> ctorParser
+          <$> locatedParser ctorParser
           <*> optional (parens $ commaSep exprParser)
         <|> String <$> stringParser
         <|> MultilineString <$> multilineStringParser
         <|> Array <$> between (symbolic '[') (symbolic ']') (commaSep exprParser)
+        <|> recordParser
     )
     <|> parens exprParser
   where
@@ -456,20 +461,27 @@ atomParser =
           (:) (PartText $ fromString "\n")
             <$> multilineLinesParser
 
+    recordParser =
+      Record
+        <$> between
+          (symbolic '{')
+          (symbolic '}')
+          (commaSep $ (,) <$> locatedParser identParser <* symbolic '=' <*> exprParser)
+
 fieldParser :: Parser (Field Offset)
 fieldParser =
-  FStatic <$> identParser
+  FStatic <$> locatedParser identParser
     <|> FDynamic <$> between (symbolic '{') (symbolic '}') exprParser
 
 branchParser :: Parser (Branch Offset)
 branchParser =
   Branch <$ symbolic '|' <*> locatedParser patternParser <* symbol (fromString "->") <*> exprParser
 
-patternParser :: Parser Pattern
+patternParser :: Parser (Pattern Offset)
 patternParser =
   (\name -> PConstructor name . fromMaybe [])
-    <$> ctorParser
-    <*> optional (parens $ commaSep identParser)
+    <$> locatedParser ctorParser
+    <*> optional (parens $ commaSep (locatedParser identParser))
 
 isIdentContinue :: Char -> Bool
 isIdentContinue = (||) <$> Char.isAlphaNum <*> (`elem` "-_")
@@ -499,25 +511,25 @@ data TypeError loc
   | TypeMismatch
       !loc
       -- | Expected
-      !Type
+      !(Type loc)
       -- | Actual
-      !Type
+      !(Type loc)
   | UnexpectedFields
       !loc
       -- | Actual
-      ![(Text, Type)]
+      ![(LText loc, LType loc)]
   | MissingFields
       !loc
       -- | Expected
-      ![(Text, Type)]
+      ![(LText loc, LType loc)]
   | UnexpectedConstructors
       !loc
       -- | Actual
-      ![(Text, [Type])]
+      ![(LText loc, [LType loc])]
   | MissingConstructors
       !loc
       -- | Expected
-      ![(Text, [Type])]
+      ![(LText loc, [LType loc])]
   | ArityMismatch
       !loc
       -- | Expected
@@ -537,7 +549,7 @@ data TypeError loc
   | BlockBadRequirementType
       !loc
       -- | Actual requirement type
-      !Type
+      !(Type loc)
   | RequirementAlreadySatisfied
       !loc
   | FileNotFound
@@ -597,33 +609,33 @@ typeErrorLoc err =
     NotParam loc -> loc
     ParamAlreadyBound loc -> loc
 
-data Type
+data Type loc
   = TMeta !Int
   | TVar !Text
   | TBool
   | TString
-  | TFn ![Type] Type
-  | TStream !Type
-  | TRecord !Type
+  | TFn ![Type loc] (Type loc)
+  | TStream !(Type loc)
+  | TRecord !(Type loc)
   | TRecordField
       -- | Field name
-      !Text
+      !(LText loc)
       -- | Field type
-      !Type
+      !(LType loc)
       -- | Rest
-      !Type
-  | TSum !Type
+      !(Type loc)
+  | TSum !(Type loc)
   | TSumConstructor
       -- | Constructor name
-      !Text
+      !(LText loc)
       -- | Constructor arguments
-      ![Type]
+      ![LType loc]
       -- | Rest
-      !Type
+      !(Type loc)
   | TRowEnd
   deriving (Show)
 
-renderType :: Type -> String
+renderType :: Type loc -> String
 renderType (TMeta v) = "?" ++ show v
 renderType (TVar v) = Text.unpack v
 renderType TBool = "Bool"
@@ -632,25 +644,25 @@ renderType (TFn args retTy) = "Fn(" ++ intercalate ", " (fmap renderType args) +
 renderType (TStream ty) = "Stream(" ++ renderType ty ++ ")"
 renderType (TRecord fields) = "{" ++ renderType fields ++ "}"
 renderType (TRecordField name ty rest) =
-  Text.unpack name
+  Text.unpack (locatedVal name)
     ++ " : "
-    ++ renderType ty
+    ++ renderType (locatedVal ty)
     ++ case rest of
       TRowEnd -> ""
       _ -> ", " ++ renderType rest
 renderType (TSum ctors) = "Sum(" ++ renderType ctors ++ ")"
 renderType (TSumConstructor name tys rest) =
-  Text.unpack name
+  Text.unpack (locatedVal name)
     ++ ( if null tys
            then ""
-           else "(" ++ intercalate ", " (fmap renderType tys) ++ ")"
+           else "(" ++ intercalate ", " (fmap (renderType . locatedVal) tys) ++ ")"
        )
     ++ case rest of
       TRowEnd -> ""
       _ -> " | " ++ renderType rest
 renderType TRowEnd = ""
 
-renderTypeScheme :: TypeScheme -> String
+renderTypeScheme :: TypeScheme loc -> String
 renderTypeScheme (Forall vars ty) =
   case vars of
     [] -> renderType ty
@@ -660,7 +672,7 @@ renderKind :: Kind -> String
 renderKind KType = "Type"
 renderKind KRow = "Row"
 
-subst :: Map Text Type -> Type -> Type
+subst :: Map Text (Type loc) -> Type loc -> Type loc
 subst sub ty@(TVar v) =
   case Map.lookup v sub of
     Nothing -> ty
@@ -671,12 +683,12 @@ subst _ TString = TString
 subst sub (TFn args ret) = TFn (fmap (subst sub) args) (subst sub ret)
 subst sub (TStream item) = TStream (subst sub item)
 subst sub (TRecord fields) = TRecord (subst sub fields)
-subst sub (TRecordField name ty rest) = TRecordField name (subst sub ty) (subst sub rest)
+subst sub (TRecordField name ty rest) = TRecordField name (fmap (subst sub) ty) (subst sub rest)
 subst sub (TSum ctors) = TSum (subst sub ctors)
-subst sub (TSumConstructor name tys rest) = TSumConstructor name (fmap (subst sub) tys) (subst sub rest)
+subst sub (TSumConstructor name tys rest) = TSumConstructor name (fmap (fmap (subst sub)) tys) (subst sub rest)
 subst _ TRowEnd = TRowEnd
 
-substMetas :: (Int -> Type) -> Type -> Type
+substMetas :: (Int -> Type loc) -> Type loc -> Type loc
 substMetas f (TMeta v) = f v
 substMetas _f t@TVar{} = t
 substMetas _f TBool = TBool
@@ -684,12 +696,12 @@ substMetas _f TString = TString
 substMetas f (TFn args retTy) = TFn (fmap (substMetas f) args) (substMetas f retTy)
 substMetas f (TStream t) = TStream (substMetas f t)
 substMetas f (TRecord fields) = TRecord (substMetas f fields)
-substMetas f (TRecordField name t rest) = TRecordField name (substMetas f t) (substMetas f rest)
+substMetas f (TRecordField name t rest) = TRecordField name (fmap (substMetas f) t) (substMetas f rest)
 substMetas f (TSum ctors) = TSum (substMetas f ctors)
-substMetas f (TSumConstructor name tys rest) = TSumConstructor name (fmap (substMetas f) tys) (substMetas f rest)
+substMetas f (TSumConstructor name tys rest) = TSumConstructor name (fmap (fmap (substMetas f)) tys) (substMetas f rest)
 substMetas _f TRowEnd = TRowEnd
 
-metavarsOf :: Type -> [Int]
+metavarsOf :: Type loc -> [Int]
 metavarsOf (TMeta v) = [v]
 metavarsOf TVar{} = []
 metavarsOf TBool = []
@@ -697,12 +709,12 @@ metavarsOf TString = []
 metavarsOf (TFn args retTy) = foldMap metavarsOf args <> metavarsOf retTy
 metavarsOf (TStream ty) = metavarsOf ty
 metavarsOf (TRecord fields) = metavarsOf fields
-metavarsOf (TRecordField _name ty rest) = metavarsOf ty <> metavarsOf rest
+metavarsOf (TRecordField _name ty rest) = foldMap metavarsOf ty <> metavarsOf rest
 metavarsOf (TSum ctors) = metavarsOf ctors
-metavarsOf (TSumConstructor _name tys rest) = foldMap metavarsOf tys <> metavarsOf rest
+metavarsOf (TSumConstructor _name tys rest) = (foldMap . foldMap) metavarsOf tys <> metavarsOf rest
 metavarsOf TRowEnd = []
 
-freeTypeVars :: Type -> Set Text
+freeTypeVars :: Type loc -> Set Text
 freeTypeVars TMeta{} = mempty
 freeTypeVars (TVar v) = Set.singleton v
 freeTypeVars TBool = mempty
@@ -710,15 +722,15 @@ freeTypeVars TString = mempty
 freeTypeVars (TFn args retTy) = foldMap freeTypeVars args <> freeTypeVars retTy
 freeTypeVars (TStream ty) = freeTypeVars ty
 freeTypeVars (TRecord fields) = freeTypeVars fields
-freeTypeVars (TRecordField _name ty rest) = freeTypeVars ty <> freeTypeVars rest
+freeTypeVars (TRecordField _name ty rest) = foldMap freeTypeVars ty <> freeTypeVars rest
 freeTypeVars (TSum ctors) = freeTypeVars ctors
-freeTypeVars (TSumConstructor _name tys rest) = foldMap freeTypeVars tys <> freeTypeVars rest
+freeTypeVars (TSumConstructor _name tys rest) = (foldMap . foldMap) freeTypeVars tys <> freeTypeVars rest
 freeTypeVars TRowEnd = mempty
 
 data Binding
   = Binding
   { bindingName :: !Text
-  , bindingScheme :: !TypeScheme
+  , bindingScheme :: !(TypeScheme Offset)
   , bindingLocations :: !(NonEmpty (TemplateRef, Offset))
   }
 
@@ -753,8 +765,8 @@ inferBindings readTemplateRef currentTemplate template = do
   where
     generaliseBinding ::
       Monad m =>
-      (Text, Type, NonEmpty (TemplateRef, Offset)) ->
-      InferT loc m Binding
+      (Text, Type Offset, NonEmpty (TemplateRef, Offset)) ->
+      InferT Offset m Binding
     generaliseBinding (name, ty, locations) = do
       ty' <- zonkDefault ty
       pure $ Binding name (generalise ty') locations
@@ -764,7 +776,7 @@ inferBindings readTemplateRef currentTemplate template = do
       fmap Text.pack $
         [[c] | c <- ['a' .. 'z']] ++ [c : show n | n <- [1 :: Int ..], c <- ['a' .. 'z']]
 
-    generalise :: Type -> TypeScheme
+    generalise :: Type loc -> TypeScheme loc
     generalise ty =
       Forall
         boundVars
@@ -783,29 +795,29 @@ inferBindings readTemplateRef currentTemplate template = do
         nameFor = IntMap.fromList $ zip metas boundVars
 
 newtype InferT loc m a
-  = InferT (ReaderT (InferEnv m) (StateT (InferState loc) (ExceptT (TypeError loc) m)) a)
+  = InferT (ReaderT (InferEnv loc m) (StateT (InferState loc) (ExceptT (TypeError loc) m)) a)
   deriving
-    (Functor, Applicative, Monad, MonadIO, MonadReader (InferEnv m), MonadError (TypeError loc))
+    (Functor, Applicative, Monad, MonadIO, MonadReader (InferEnv loc m), MonadError (TypeError loc))
 
 instance MonadTrans (InferT loc) where
   lift = InferT . lift . lift . lift
 
 runInferT ::
   Monad m =>
-  InferEnv m ->
+  InferEnv loc m ->
   InferState loc ->
   InferT loc m a ->
   m (Either (TypeError loc) (InferState loc, a))
 runInferT e s (InferT ma) = runExceptT . fmap Tuple.swap . flip runStateT s . flip runReaderT e $ ma
 
-data InferEnv m
+data InferEnv loc m
   = InferEnv
   { ieCurrentTemplate :: !TemplateRef
   , ieReadTemplateRef :: !(TemplateRef -> m (Maybe ByteString))
-  , ieScope :: !(Map Text TypeScheme)
+  , ieScope :: !(Map Text (TypeScheme loc))
   }
 
-data TypeScheme = Forall ![Text] Type
+data TypeScheme loc = Forall ![Text] (Type loc)
   deriving (Show)
 
 emptyInferEnv ::
@@ -813,7 +825,7 @@ emptyInferEnv ::
   (TemplateRef -> m (Maybe ByteString)) ->
   -- | Current template
   TemplateRef ->
-  InferEnv m
+  InferEnv loc m
 emptyInferEnv readTemplateRef currentTemplate =
   InferEnv{ieReadTemplateRef = readTemplateRef, ieCurrentTemplate = currentTemplate, ieScope = mempty}
 
@@ -822,10 +834,10 @@ defaultInferEnv ::
   (TemplateRef -> m (Maybe ByteString)) ->
   -- | Current template
   TemplateRef ->
-  InferEnv m
+  InferEnv loc m
 defaultInferEnv readTemplateRef currentTemplate = (emptyInferEnv readTemplateRef currentTemplate){ieScope = defaultScope}
 
-builtins :: Map Text (Value, TypeScheme)
+builtins :: Map Text (Value, TypeScheme loc)
 builtins =
   let
     strip =
@@ -956,26 +968,26 @@ builtins =
       ]
 
 -- | @defaultScope = fmap snd 'builtins'@
-defaultScope :: Map Text TypeScheme
+defaultScope :: Map Text (TypeScheme loc)
 defaultScope = fmap snd builtins
 
 data InferState loc
   = InferState
-  { isMetavars :: !(IntMap Metavar)
+  { isMetavars :: !(IntMap (Metavar loc))
   , isRequirements :: ![Requirement loc]
   , isDependencies :: !(Map TemplateRef (Template loc))
   }
 
-data Metavar
+data Metavar loc
   = Metavar
   { metaKind :: Kind
-  , metaSolution :: Maybe Type
+  , metaSolution :: Maybe (Type loc)
   }
 
 data Requirement loc
   = Requirement
   { reqName :: !Text
-  , reqType :: !Type
+  , reqType :: !(Type loc)
   , reqLocations :: NonEmpty (TemplateRef, loc)
   -- ^ Places where the binding is introduced.
   , reqSatisfied :: !Bool
@@ -1041,7 +1053,7 @@ checkPragma (PragmaWith vars) =
           then
             throwError $ RequirementAlreadySatisfied (locatedLoc name)
           else do
-            checkExpr checkPartInclude value $ reqType req
+            checkExpr checkPartInclude value (reqType req)
             satisfyRequirement $ locatedVal name
 
 lookupRequirement :: Monad m => Text -> InferT loc m (Maybe (Requirement loc))
@@ -1118,13 +1130,13 @@ checkPartInclude target mWith = do
           | reqSatisfied req ->
               throwError $ ParamAlreadyBound (locatedLoc name)
           | otherwise -> do
-              checkExpr checkPartInclude value $ reqType req
+              checkExpr checkPartInclude value (reqType req)
               pure $ modifyRequirement (locatedVal name) (\r -> r{reqSatisfied = True}) reqs
 
 checkPartIncludeDisabled ::
   MonadIO m =>
   Located loc TemplateRef ->
-  Maybe [(Located loc Text, LExpr loc)] ->
+  Maybe [(LText loc, LExpr loc)] ->
   InferT loc m ()
 checkPartIncludeDisabled target _mWith =
   throwError $ IncludeDisabled (locatedLoc target)
@@ -1135,7 +1147,7 @@ checkPart ::
 
   See: 'checkPartInclude', 'checkPartIncludeDisabled'
   -}
-  (Located loc TemplateRef -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  (Located loc TemplateRef -> Maybe [(LText loc, LExpr loc)] -> InferT loc m ()) ->
   Part loc ->
   InferT loc m ()
 checkPart _fInclude PartText{} = pure ()
@@ -1143,16 +1155,16 @@ checkPart fInclude (PartExpr e) = checkExpr fInclude e TString
 checkPart fInclude (PartExprStream e) = checkExpr fInclude e (TStream TString)
 checkPart fInclude (PartInclude target mWith) = fInclude target mWith
 
-instantiateTypeScheme :: Monad m => TypeScheme -> InferT loc m Type
+instantiateTypeScheme :: Monad m => TypeScheme loc -> InferT loc m (Type loc)
 instantiateTypeScheme (Forall vars ty) = do
   sub <- Map.fromList <$> traverse (\var -> (,) var <$> metavar KType) vars
   pure $ subst sub ty
 
 checkExpr ::
   MonadIO m =>
-  (Located loc TemplateRef -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  (Located loc TemplateRef -> Maybe [(LText loc, LExpr loc)] -> InferT loc m ()) ->
   LExpr loc ->
-  Type ->
+  Type loc ->
   InferT loc m ()
 checkExpr _fInclude (Located offset (Var v)) t = do
   mTy <- asks (Map.lookup v . ieScope)
@@ -1170,38 +1182,40 @@ checkExpr fInclude (Located offset (MultilineString parts)) t = do
   unify offset t TString
   traverse_ (checkPart fInclude) parts
 checkExpr fInclude (Located offset (Call name args)) t = do
-  argTys <- traverse (const $ metavar KType) args
+  argTys <- traverse (\arg -> Located (locatedLoc arg) <$> metavar KType) args
   mTy <- asks (Map.lookup (locatedVal name) . ieScope)
   ty <-
     case mTy of
       Nothing -> throwError $ NotInScope (locatedLoc name)
       Just ty -> instantiateTypeScheme ty
-  unify offset (TFn argTys t) ty
+  unify offset (TFn (fmap locatedVal argTys) t) ty
   for_ (zip args argTys) $ \(arg, argTy) -> do
-    checkExpr fInclude arg argTy
+    checkExpr fInclude arg $ locatedVal argTy
 checkExpr fInclude (Located offset (Record fields)) t = do
-  fieldsWithTys <- traverse (\(name, e) -> (,,) name e <$> metavar KType) fields
+  fieldsWithTys <-
+    traverse (\(name, e) -> (,,) name e . Located (locatedLoc e) <$> metavar KType) fields
   let actual = TRecord $ foldr (\(name, _e, ty) -> TRecordField name ty) TRowEnd fieldsWithTys
   unify offset t actual
-  traverse_ (\(_name, e, ty) -> checkExpr fInclude e ty) fieldsWithTys
-checkExpr fInclude (Located _offset (Field e f)) t =
+  traverse_ (\(_name, e, ty) -> checkExpr fInclude e $ locatedVal ty) fieldsWithTys
+checkExpr fInclude (Located offset (Field e f)) t =
   case f of
     FDynamic _f' ->
       error "TODO: dynamic record fields"
     FStatic f' -> do
       rest <- metavar KRow
-      checkExpr fInclude e (TRecord $ TRecordField f' t rest)
+      checkExpr fInclude e (TRecord $ TRecordField f' (Located offset t) rest)
 checkExpr fInclude (Located offset (Constructor name args)) t = do
-  argTys <- traverse (const $ metavar KType) args
+  argTys <- traverse (\arg -> Located (locatedLoc arg) <$> metavar KType) args
   rest <- metavar KRow
   unify offset t (TSum $ TSumConstructor name argTys rest)
   for_ (zip args argTys) $ \(arg, argTy) ->
-    checkExpr fInclude arg argTy
+    checkExpr fInclude arg $ locatedVal argTy
 checkExpr fInclude (Located _offset (Match e bs)) t = do
   eTy <- inferExpr fInclude e
   for_ bs $ \(Branch p body) -> do
     bindings <- checkPattern p eTy
-    local (\env -> env{ieScope = fmap (Forall []) bindings <> ieScope env}) $ checkExpr fInclude body t
+    local (\env -> env{ieScope = fmap (Forall [] . locatedVal) bindings <> ieScope env}) $
+      checkExpr fInclude body t
 checkExpr fInclude (Located _offset (IfThenElse cond th el)) t = do
   checkExpr fInclude cond TBool
   checkExpr fInclude th t
@@ -1216,35 +1230,35 @@ checkExpr fInclude (Located offset (For name items value)) t = do
   unify offset t (TStream valueTy)
   itemTy <- metavar KType
   checkExpr fInclude items (TStream itemTy)
-  local (\env -> env{ieScope = Map.insert name (Forall [] itemTy) $ ieScope env}) $
+  local (\env -> env{ieScope = Map.insert (locatedVal name) (Forall [] itemTy) $ ieScope env}) $
     checkExpr fInclude value valueTy
 
 inferExpr ::
   MonadIO m =>
-  (Located loc TemplateRef -> Maybe [(Located loc Text, LExpr loc)] -> InferT loc m ()) ->
+  (Located loc TemplateRef -> Maybe [(LText loc, LExpr loc)] -> InferT loc m ()) ->
   LExpr loc ->
-  InferT loc m Type
+  InferT loc m (Type loc)
 inferExpr fInclude e = do
   t <- metavar KType
   t <$ checkExpr fInclude e t
 
 checkPattern ::
   Monad m =>
-  Located loc Pattern ->
-  Type ->
-  InferT loc m (Map Text Type)
+  Located loc (Pattern loc) ->
+  Type loc ->
+  InferT loc m (Map Text (LType loc))
 checkPattern (Located offset (PConstructor name args)) t = do
-  argTys <- traverse (\arg -> (,) arg <$> metavar KType) args
+  argTys <- traverse (\arg -> (,) arg . Located (locatedLoc arg) <$> metavar KType) args
   rest <- metavar KRow
   unify offset t (TSum $ TSumConstructor name (fmap snd argTys) rest)
-  pure $ Map.fromList argTys
+  pure . Map.fromList $ (fmap . first) locatedVal argTys
 
 require ::
   Monad m =>
   -- | Location of variable
   loc ->
   Text ->
-  InferT loc m Type
+  InferT loc m (Type loc)
 require offset name = do
   currentTemplate <- asks ieCurrentTemplate
   mReq <- lookupRequirement name
@@ -1280,7 +1294,7 @@ updateRequirement new (req : reqs)
   | reqName new == reqName req = new : reqs
   | otherwise = req : updateRequirement new reqs
 
-metavar :: Monad m => Kind -> InferT loc m Type
+metavar :: Monad m => Kind -> InferT loc m (Type loc)
 metavar kind = InferT $ do
   s <- get
   let metavars = isMetavars s
@@ -1297,9 +1311,9 @@ unify ::
   -}
   loc ->
   -- | Expected
-  Type ->
+  Type loc ->
   -- | Actual
-  Type ->
+  Type loc ->
   InferT loc m ()
 unify offset (TMeta m) ty = solveL offset m ty
 unify offset ty (TMeta m) = solveR offset ty m
@@ -1345,7 +1359,7 @@ unify offset (TRecord fields) ty =
     TRecord fields' -> do
       (fields1, rest) <- getRecordFields fields
       (fields1', rest') <- getRecordFields fields'
-      (unmatched, unmatched') <- unifyFields offset fields1 fields1'
+      (unmatched, unmatched') <- unifyFields fields1 fields1'
       final <- metavar KRow
       solveRecordTailL offset rest unmatched' final
       solveRecordTailR offset unmatched rest' final
@@ -1358,7 +1372,7 @@ unify offset (TSum ctors) ty =
     TSum ctors' -> do
       (ctors1, rest) <- getSumConstructors ctors
       (ctors1', rest') <- getSumConstructors ctors'
-      (unmatched, unmatched') <- unifyConstructors offset ctors1 ctors1'
+      (unmatched, unmatched') <- unifyConstructors ctors1 ctors1'
       final <- metavar KRow
       solveSumTailL offset rest unmatched' final
       solveSumTailR offset unmatched rest' final
@@ -1372,51 +1386,45 @@ unify _offset TRowEnd{} _ = error "don't unify TRowEnd"
 
 unifyFields ::
   Monad m =>
-  {-| Location that generated the constraint.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
-  [(Text, Type)] ->
-  [(Text, Type)] ->
-  InferT loc m ([(Text, Type)], [(Text, Type)])
-unifyFields offset expected actual = do
+  [(LText loc, LType loc)] ->
+  [(LText loc, LType loc)] ->
+  InferT loc m ([(LText loc, LType loc)], [(LText loc, LType loc)])
+unifyFields expected actual = do
   let !remainingExpected = expected' `Map.difference` actual'
   let !remainingActual = actual' `Map.difference` expected'
-  for_ expected $ \(name, ty) ->
-    for_ (Map.lookup name actual') $ \ty' -> do
-      unify offset ty ty'
-  pure (Map.toList remainingExpected, Map.toList remainingActual)
+  for_ actual $ \(name, ty') ->
+    for_ (Map.lookup (locatedVal name) expected') $ \ty -> do
+      unify (locatedLoc ty) (locatedVal ty) (locatedVal ty')
+  pure
+    ( filter (\(name, _) -> locatedVal name `Map.member` remainingExpected) expected
+    , filter (\(name, _) -> locatedVal name `Map.member` remainingActual) actual
+    )
   where
-    expected' = Map.fromList expected
-    actual' = Map.fromList actual
+    expected' = Map.fromList $ (fmap . first) locatedVal expected
+    actual' = Map.fromList $ (fmap . first) locatedVal actual
 
 unifyConstructors ::
   Monad m =>
-  {-| Location that generated the constraint.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
-  [(Text, [Type])] ->
-  [(Text, [Type])] ->
-  InferT loc m ([(Text, [Type])], [(Text, [Type])])
-unifyConstructors offset expected actual = do
+  [(LText loc, [LType loc])] ->
+  [(LText loc, [LType loc])] ->
+  InferT loc m ([(LText loc, [LType loc])], [(LText loc, [LType loc])])
+unifyConstructors expected actual = do
   let !remainingExpected = expected' `Map.difference` actual'
   let !remainingActual = actual' `Map.difference` expected'
-  for_ expected $ \(name, tys) -> do
-    for_ (Map.lookup name actual') $ \tys' -> do
+  for_ actual $ \(name, tys') -> do
+    for_ (Map.lookup (locatedVal name) expected') $ \tys -> do
       when (length tys /= length tys') . throwError $
-        ArityMismatch offset (length tys) (length tys')
-      traverse_ (uncurry $ unify offset) $ zip tys tys'
-  pure (Map.toList remainingExpected, Map.toList remainingActual)
+        ArityMismatch (locatedLoc name) (length tys) (length tys')
+      traverse_ (\(ty, ty') -> unify (locatedLoc ty) (locatedVal ty) (locatedVal ty')) $ zip tys tys'
+  pure
+    ( filter (\(name, _) -> locatedVal name `Map.member` remainingExpected) expected
+    , filter (\(name, _) -> locatedVal name `Map.member` remainingActual) actual
+    )
   where
-    expected' = Map.fromList expected
-    actual' = Map.fromList actual
+    expected' = Map.fromList $ (fmap . first) locatedVal expected
+    actual' = Map.fromList $ (fmap . first) locatedVal actual
 
-getRecordFields :: Monad m => Type -> InferT loc m ([(Text, Type)], Maybe Int)
+getRecordFields :: Monad m => Type loc -> InferT loc m ([(LText loc, LType loc)], Maybe Int)
 getRecordFields (TRecordField name ty rest) = do
   (fields, end) <- getRecordFields rest
   pure ((name, ty) : fields, end)
@@ -1428,9 +1436,9 @@ getRecordFields (TMeta v) = do
     Nothing -> error $ "missing metavar: " ++ show v
     Just meta -> maybe (pure ([], Just v)) getRecordFields $ metaSolution meta
 getRecordFields ty =
-  error $ "not record field: " ++ show ty
+  error $ "not record field: " ++ renderType ty
 
-getSumConstructors :: Monad m => Type -> InferT loc m ([(Text, [Type])], Maybe Int)
+getSumConstructors :: Monad m => Type loc -> InferT loc m ([(LText loc, [LType loc])], Maybe Int)
 getSumConstructors (TSumConstructor name tys rest) = do
   (fields, end) <- getSumConstructors rest
   pure ((name, tys) : fields, end)
@@ -1442,9 +1450,9 @@ getSumConstructors (TMeta v) = do
     Nothing -> error $ "missing metavar: " ++ show v
     Just meta -> maybe (pure ([], Just v)) getSumConstructors $ metaSolution meta
 getSumConstructors ty =
-  error $ "not sum constructor: " ++ show ty
+  error $ "not sum constructor: " ++ renderType ty
 
-kindOf :: Monad m => Type -> InferT loc m Kind
+kindOf :: Monad m => Type loc -> InferT loc m Kind
 kindOf (TMeta v) = do
   mMeta <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mMeta of
@@ -1472,7 +1480,7 @@ solveL ::
   -- | Expected
   Int ->
   -- | Actual
-  Type ->
+  Type loc ->
   InferT loc m ()
 solveL offset v ty' = do
   mMeta <- InferT $ gets (IntMap.lookup v . isMetavars)
@@ -1496,7 +1504,7 @@ solveR ::
   -}
   loc ->
   -- | Expected
-  Type ->
+  Type loc ->
   -- | Actual
   Int ->
   InferT loc m ()
@@ -1524,9 +1532,9 @@ solveRecordTailL ::
   -- | Optional metavariable for the "expected" record's tail.
   Maybe Int ->
   -- | Remaining "actual" fields
-  [(Text, Type)] ->
+  [(LText loc, LType loc)] ->
   -- | Shared tail of the unified records
-  Type ->
+  Type loc ->
   InferT loc m ()
 solveRecordTailL offset rest unmatched' final =
   case rest of
@@ -1545,11 +1553,11 @@ solveRecordTailR ::
   -}
   loc ->
   -- | Remaining "expected" fields
-  [(Text, Type)] ->
+  [(LText loc, LType loc)] ->
   -- | Optional metavariable for the "actual" record's tail.
   Maybe Int ->
   -- | Shared tail of the unified records
-  Type ->
+  Type loc ->
   InferT loc m ()
 solveRecordTailR offset unmatched rest' final = do
   case rest' of
@@ -1570,9 +1578,9 @@ solveSumTailL ::
   -- | Optional metavariable for the "expected" sum's tail.
   Maybe Int ->
   -- | Remaining "actual" constructors
-  [(Text, [Type])] ->
+  [(LText loc, [LType loc])] ->
   -- | Shared tail of the unified sums
-  Type ->
+  Type loc ->
   InferT loc m ()
 solveSumTailL offset rest unmatched' final =
   case rest of
@@ -1591,11 +1599,11 @@ solveSumTailR ::
   -}
   loc ->
   -- | Remaining "expected" constructors
-  [(Text, [Type])] ->
+  [(LText loc, [LType loc])] ->
   -- | Optional metavariable for the "actual" sum's tail.
   Maybe Int ->
   -- | Shared tail of the unified sums
-  Type ->
+  Type loc ->
   InferT loc m ()
 solveSumTailR offset unmatched rest' final = do
   case rest' of
@@ -1607,22 +1615,22 @@ solveSumTailR offset unmatched rest' final = do
 
 zonkNoDefault ::
   Monad m =>
-  Type ->
-  InferT loc m Type
+  Type loc ->
+  InferT loc m (Type loc)
 zonkNoDefault = zonk False
 
 zonkDefault ::
   Monad m =>
-  Type ->
-  InferT loc m Type
+  Type loc ->
+  InferT loc m (Type loc)
 zonkDefault = zonk True
 
 zonk ::
   Monad m =>
   -- | Replace unsolved metas with default types
   Bool ->
-  Type ->
-  InferT loc m Type
+  Type loc ->
+  InferT loc m (Type loc)
 zonk def (TMeta v) = do
   mmTy <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mmTy of
@@ -1642,9 +1650,9 @@ zonk _def TString = pure TString
 zonk def (TFn args retTy) = TFn <$> traverse (zonk def) args <*> zonk def retTy
 zonk def (TStream ty) = TStream <$> zonk def ty
 zonk def (TRecord fields) = TRecord <$> zonk def fields
-zonk def (TRecordField name ty rest) = TRecordField name <$> zonk def ty <*> zonk def rest
+zonk def (TRecordField name ty rest) = TRecordField name <$> traverse (zonk def) ty <*> zonk def rest
 zonk def (TSum ctors) = TSum <$> zonk def ctors
-zonk def (TSumConstructor name tys rest) = TSumConstructor name <$> traverse (zonk def) tys <*> zonk def rest
+zonk def (TSumConstructor name tys rest) = TSumConstructor name <$> (traverse . traverse) (zonk def) tys <*> zonk def rest
 zonk _def TRowEnd = pure TRowEnd
 
 data Value
@@ -1771,14 +1779,14 @@ evalExpr env (Call name args) =
   in
     f args'
 evalExpr env (Record fields) =
-  VRecord $! Map.fromList ((fmap . fmap) (evalExpr env . locatedVal) fields)
+  VRecord $! Map.fromList (fmap (bimap locatedVal (evalExpr env . locatedVal)) fields)
 evalExpr env (Field expr field) =
   let
     record = valueRecord $ evalExpr env (locatedVal expr)
     field' =
       case field of
         FStatic f ->
-          f
+          locatedVal f
         FDynamic e ->
           Text.Encoding.decodeUtf8
             . LazyByteString.toStrict
@@ -1799,7 +1807,7 @@ evalExpr env (Constructor name args) =
   let
     !args' = fmap (evalExpr env . locatedVal) args
   in
-    VConstructor name args'
+    VConstructor (locatedVal name) args'
 evalExpr env (Match e bs) =
   let
     v = evalExpr env (locatedVal e)
@@ -1824,18 +1832,20 @@ evalExpr env (For name xs yield) =
   let
     xs' = valueStream $ evalExpr env (locatedVal xs)
   in
-    VStream [evalExpr env{eeScope = Map.insert name x' $ eeScope env} (locatedVal yield) | x' <- xs']
+    VStream
+      [ evalExpr env{eeScope = Map.insert (locatedVal name) x' $ eeScope env} (locatedVal yield) | x' <- xs'
+      ]
 
-match :: Pattern -> Value -> Maybe (Map Text Value)
+match :: Pattern loc -> Value -> Maybe (Map Text Value)
 match (PConstructor name args) v =
   case v of
     VConstructor name' args'
-      | name == name' ->
+      | locatedVal name == name' ->
           if length args == length args'
-            then Just $ Map.fromList (zip args args')
+            then Just $ Map.fromList (zip (fmap locatedVal args) args')
             else
               error $
-                Text.unpack name
+                Text.unpack (locatedVal name)
                   ++ " requires "
                   ++ show (length args)
                   ++ " arguments, got "

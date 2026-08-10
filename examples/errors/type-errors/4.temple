@@ -1,0 +1,1 @@
+{% include "4-include.temple" with a = { x = "x" } %}

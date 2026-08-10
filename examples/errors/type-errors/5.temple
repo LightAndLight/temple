@@ -1,0 +1,10 @@
+{{
+  match x
+  | Pair(a, b) -> a
+}}
+
+{{*
+  match x
+  | Pair(a, b) -> a
+}}
+

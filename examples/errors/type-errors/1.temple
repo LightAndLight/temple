@@ -1,0 +1,3 @@
+{{test.x}}
+
+{{*for item in test.x yield item}}

@@ -1,0 +1,9 @@
+{{
+match test
+| Pair(a, b) -> a
+}}
+
+{{
+match test
+| Pair(c) -> c
+}}
