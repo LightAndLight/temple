@@ -62,6 +62,7 @@ module Temple
   , checkPartInclude
   , checkPartIncludeDisabled
   , instantiateTypeScheme
+  , unify
   , zonkDefault
   , zonkNoDefault
 
