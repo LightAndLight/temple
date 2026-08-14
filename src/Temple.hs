@@ -63,6 +63,7 @@ module Temple
   , checkPartIncludeDisabled
   , generaliseType
   , instantiateTypeScheme
+  , metavar
   , unify
   , zonkDefault
   , zonkNoDefault
@@ -1281,6 +1282,7 @@ updateRequirement new (req : reqs)
   | reqName new == reqName req = new : reqs
   | otherwise = req : updateRequirement new reqs
 
+-- | Generate a unification variable.
 metavar :: Monad m => Kind -> InferT loc m Type
 metavar kind = InferT $ do
   s <- get
