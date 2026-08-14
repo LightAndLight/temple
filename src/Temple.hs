@@ -61,6 +61,7 @@ module Temple
   , checkPart
   , checkPartInclude
   , checkPartIncludeDisabled
+  , generaliseType
   , instantiateTypeScheme
   , unify
   , zonkDefault
@@ -757,30 +758,30 @@ inferBindings readTemplateRef currentTemplate template = do
       InferT loc m Binding
     generaliseBinding (name, ty, locations) = do
       ty' <- zonkDefault ty
-      pure $ Binding name (generalise ty') locations
+      pure $ Binding name (generaliseType ty') locations
 
-    varNameSupply :: [Text]
-    varNameSupply =
-      fmap Text.pack $
-        [[c] | c <- ['a' .. 'z']] ++ [c : show n | n <- [1 :: Int ..], c <- ['a' .. 'z']]
+varNameSupply :: [Text]
+varNameSupply =
+  fmap Text.pack $
+    [[c] | c <- ['a' .. 'z']] ++ [c : show n | n <- [1 :: Int ..], c <- ['a' .. 'z']]
 
-    generalise :: Type -> TypeScheme
-    generalise ty =
-      Forall
-        boundVars
-        ( substMetas
-            ( \v ->
-                maybe
-                  (error $ "no name for " ++ show v ++ " in " ++ show nameFor)
-                  TVar
-                  (IntMap.lookup v nameFor)
-            )
-            ty
+generaliseType :: Type -> TypeScheme
+generaliseType ty =
+  Forall
+    boundVars
+    ( substMetas
+        ( \v ->
+            maybe
+              (error $ "no name for " ++ show v ++ " in " ++ show nameFor)
+              TVar
+              (IntMap.lookup v nameFor)
         )
-      where
-        metas = nub $ metavarsOf ty
-        boundVars = take (length metas) $ filter (`Set.notMember` freeTypeVars ty) varNameSupply
-        nameFor = IntMap.fromList $ zip metas boundVars
+        ty
+    )
+  where
+    metas = nub $ metavarsOf ty
+    boundVars = take (length metas) $ filter (`Set.notMember` freeTypeVars ty) varNameSupply
+    nameFor = IntMap.fromList $ zip metas boundVars
 
 newtype InferT loc m a
   = InferT (ReaderT (InferEnv m) (StateT (InferState loc) (ExceptT (TypeError loc) m)) a)
