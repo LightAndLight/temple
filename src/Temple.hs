@@ -65,6 +65,8 @@ module Temple
   , instantiateTypeScheme
   , metavar
   , unify
+  , UnifyContext (..)
+  , unifyWithContext
   , zonkDefault
   , zonkNoDefault
 
@@ -527,7 +529,7 @@ data TypeError loc
       -- | Actual
       !Int
   | KindMismatch
-      !loc
+      !(UnifyContext loc)
       -- | Expected
       !Kind
       -- | Actual
@@ -586,7 +588,7 @@ typeErrorLoc err =
     UnexpectedConstructors loc _ -> loc
     MissingConstructors loc _ -> loc
     ArityMismatch loc _ _ -> loc
-    KindMismatch loc _ _ -> loc
+    KindMismatch loc _ _ -> ucLocation loc
     NotRequirement loc _ -> loc
     BlockBadRequirementType loc _ -> loc
     RequirementAlreadySatisfied loc -> loc
@@ -1293,103 +1295,101 @@ metavar kind = InferT $ do
 
 unify ::
   (HasCallStack, Monad m) =>
-  {-| Location that generated the constraint.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
   loc ->
   -- | Expected
   Type ->
   -- | Actual
   Type ->
   InferT loc m ()
-unify offset (TMeta m) ty = solveL offset m ty
-unify offset ty (TMeta m) = solveR offset ty m
-unify offset (TVar v) ty =
-  case ty of
-    TVar v' | v == v' -> pure ()
-    _ -> do
-      ty' <- zonk False ty
-      throwError $ TypeMismatch offset (TVar v) ty'
-unify offset TBool ty =
-  case ty of
-    TBool -> pure ()
-    _ -> do
-      ty' <- zonk False ty
-      throwError $ TypeMismatch offset TBool ty'
-unify offset TString ty =
-  case ty of
-    TString -> pure ()
-    _ -> do
-      ty' <- zonk False ty
-      throwError $ TypeMismatch offset TString ty'
-unify offset (TFn args retTy) ty =
-  case ty of
-    TFn args' retTy' -> do
-      unless (length args == length args') . throwError $
-        ArityMismatch offset (length args) (length args')
-      traverse_ (uncurry $ unify offset) (zip args args')
-      unify offset retTy retTy'
-    _ -> do
-      args' <- traverse zonkNoDefault args
-      retTy' <- zonkNoDefault retTy
-      ty' <- zonkNoDefault ty
-      throwError $ TypeMismatch offset (TFn args' retTy') ty'
-unify offset (TStream a) ty =
-  case ty of
-    TStream a' -> unify offset a a'
-    _ -> do
-      a' <- zonkNoDefault a
-      ty' <- zonkNoDefault ty
-      throwError $ TypeMismatch offset (TStream a') ty'
-unify offset (TRecord fields) ty =
-  case ty of
-    TRecord fields' -> do
-      (fields1, rest) <- getRecordFields fields
-      (fields1', rest') <- getRecordFields fields'
-      (unmatched, unmatched') <- unifyFields offset fields1 fields1'
-      final <- metavar KRow
-      solveRecordTailL offset rest unmatched' final
-      solveRecordTailR offset unmatched rest' final
-    _ -> do
-      fields' <- zonkNoDefault fields
-      ty' <- zonkNoDefault ty
-      throwError $ TypeMismatch offset (TRecord fields') ty'
-unify offset (TSum ctors) ty =
-  case ty of
-    TSum ctors' -> do
-      (ctors1, rest) <- getSumConstructors ctors
-      (ctors1', rest') <- getSumConstructors ctors'
-      (unmatched, unmatched') <- unifyConstructors offset ctors1 ctors1'
-      final <- metavar KRow
-      solveSumTailL offset rest unmatched' final
-      solveSumTailR offset unmatched rest' final
-    _ -> do
-      fields' <- zonkNoDefault ctors
-      ty' <- zonkNoDefault ty
-      throwError $ TypeMismatch offset (TSum fields') ty'
-unify _offset TRecordField{} _ = error "don't unify TRecordField"
-unify _offset TSumConstructor{} _ = error "don't unify TRecordField"
-unify _offset TRowEnd{} _ = error "don't unify TRowEnd"
+unify offset expected actual = unifyWithContext (UnifyContext offset expected actual) expected actual
+
+data UnifyContext loc
+  = UnifyContext
+  { ucLocation :: !loc
+  -- ^ Source location that caused unification.
+  , ucExpected :: !Type
+  , ucActual :: !Type
+  }
+  deriving (Show)
+
+unifyWithContext ::
+  (HasCallStack, Monad m) =>
+  UnifyContext loc ->
+  -- | Expected
+  Type ->
+  -- | Actual
+  Type ->
+  InferT loc m ()
+unifyWithContext ctx = go
+  where
+    typeMismatch = do
+      let UnifyContext offset expected actual = ctx
+      expected' <- zonk False expected
+      actual' <- zonk False actual
+      throwError $ TypeMismatch offset expected' actual'
+
+    go (TMeta m) ty = solveL ctx m ty
+    go ty (TMeta m) = solveR ctx ty m
+    go (TVar v) ty =
+      case ty of
+        TVar v' | v == v' -> pure ()
+        _ -> typeMismatch
+    go TBool ty =
+      case ty of
+        TBool -> pure ()
+        _ -> typeMismatch
+    go TString ty =
+      case ty of
+        TString -> pure ()
+        _ -> typeMismatch
+    go (TFn args retTy) ty =
+      case ty of
+        TFn args' retTy' -> do
+          unless (length args == length args') . throwError $
+            ArityMismatch (ucLocation ctx) (length args) (length args')
+          traverse_ (uncurry $ go) (zip args args')
+          go retTy retTy'
+        _ -> typeMismatch
+    go (TStream a) ty =
+      case ty of
+        TStream a' -> go a a'
+        _ -> typeMismatch
+    go (TRecord fields) ty =
+      case ty of
+        TRecord fields' -> do
+          (fields1, rest) <- getRecordFields fields
+          (fields1', rest') <- getRecordFields fields'
+          (unmatched, unmatched') <- unifyFields ctx fields1 fields1'
+          final <- metavar KRow
+          solveRecordTailL ctx rest unmatched' final
+          solveRecordTailR ctx unmatched rest' final
+        _ -> typeMismatch
+    go (TSum ctors) ty =
+      case ty of
+        TSum ctors' -> do
+          (ctors1, rest) <- getSumConstructors ctors
+          (ctors1', rest') <- getSumConstructors ctors'
+          (unmatched, unmatched') <- unifyConstructors ctx ctors1 ctors1'
+          final <- metavar KRow
+          solveSumTailL ctx rest unmatched' final
+          solveSumTailR ctx unmatched rest' final
+        _ -> typeMismatch
+    go TRecordField{} _ = error "don't unify TRecordField"
+    go TSumConstructor{} _ = error "don't unify TRecordField"
+    go TRowEnd{} _ = error "don't unify TRowEnd"
 
 unifyFields ::
   Monad m =>
-  {-| Location that generated the constraint.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   [(Text, Type)] ->
   [(Text, Type)] ->
   InferT loc m ([(Text, Type)], [(Text, Type)])
-unifyFields offset expected actual = do
+unifyFields ctx expected actual = do
   let !remainingExpected = expected' `Map.difference` actual'
   let !remainingActual = actual' `Map.difference` expected'
   for_ expected $ \(name, ty) ->
     for_ (Map.lookup name actual') $ \ty' -> do
-      unify offset ty ty'
+      unifyWithContext ctx ty ty'
   pure (Map.toList remainingExpected, Map.toList remainingActual)
   where
     expected' = Map.fromList expected
@@ -1397,23 +1397,18 @@ unifyFields offset expected actual = do
 
 unifyConstructors ::
   Monad m =>
-  {-| Location that generated the constraint.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   [(Text, [Type])] ->
   [(Text, [Type])] ->
   InferT loc m ([(Text, [Type])], [(Text, [Type])])
-unifyConstructors offset expected actual = do
+unifyConstructors ctx expected actual = do
   let !remainingExpected = expected' `Map.difference` actual'
   let !remainingActual = actual' `Map.difference` expected'
   for_ expected $ \(name, tys) -> do
     for_ (Map.lookup name actual') $ \tys' -> do
       when (length tys /= length tys') . throwError $
-        ArityMismatch offset (length tys) (length tys')
-      traverse_ (uncurry $ unify offset) $ zip tys tys'
+        ArityMismatch (ucLocation ctx) (length tys) (length tys')
+      traverse_ (uncurry $ unifyWithContext ctx) $ zip tys tys'
   pure (Map.toList remainingExpected, Map.toList remainingActual)
   where
     expected' = Map.fromList expected
@@ -1466,18 +1461,13 @@ kindOf TRowEnd = pure KRow
 
 solveL ::
   (HasCallStack, Monad m) =>
-  {-| Location that generated the solution.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   -- | Expected
   Int ->
   -- | Actual
   Type ->
   InferT loc m ()
-solveL offset v ty' = do
+solveL ctx v ty' = do
   mMeta <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mMeta of
     Nothing -> error $ "missing metavar: " ++ show v
@@ -1485,25 +1475,20 @@ solveL offset v ty' = do
       let expectedKind = metaKind meta
       actualKind <- kindOf ty'
       unless (expectedKind == actualKind) . throwError $
-        KindMismatch offset expectedKind actualKind
+        KindMismatch ctx expectedKind actualKind
       case metaSolution meta of
         Nothing -> InferT . modify $ \s -> s{isMetavars = IntMap.insert v meta{metaSolution = Just ty'} (isMetavars s)}
-        Just ty -> unify offset ty ty'
+        Just ty -> unifyWithContext ctx{ucExpected = ty} ty ty'
 
 solveR ::
   (HasCallStack, Monad m) =>
-  {-| Location that generated the solution.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   -- | Expected
   Type ->
   -- | Actual
   Int ->
   InferT loc m ()
-solveR offset ty v = do
+solveR ctx ty v = do
   mMeta' <- InferT $ gets (IntMap.lookup v . isMetavars)
   case mMeta' of
     Nothing -> error $ "missing metavar: " ++ show v
@@ -1511,19 +1496,14 @@ solveR offset ty v = do
       expectedKind <- kindOf ty
       let actualKind = metaKind meta'
       unless (expectedKind == actualKind) . throwError $
-        KindMismatch offset expectedKind actualKind
+        KindMismatch ctx expectedKind actualKind
       case metaSolution meta' of
         Nothing -> InferT . modify $ \s -> s{isMetavars = IntMap.insert v meta'{metaSolution = Just ty} (isMetavars s)}
-        Just ty' -> unify offset ty ty'
+        Just ty' -> unifyWithContext ctx{ucActual = ty'} ty ty'
 
 solveRecordTailL ::
   (HasCallStack, Monad m) =>
-  {-| Location that generated the solution.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   -- | Optional metavariable for the "expected" record's tail.
   Maybe Int ->
   -- | Remaining "actual" fields
@@ -1531,22 +1511,17 @@ solveRecordTailL ::
   -- | Shared tail of the unified records
   Type ->
   InferT loc m ()
-solveRecordTailL offset rest unmatched' final =
+solveRecordTailL ctx rest unmatched' final =
   case rest of
     Nothing ->
       unless (null unmatched') . throwError $
-        UnexpectedFields offset unmatched'
+        UnexpectedFields (ucLocation ctx) unmatched'
     Just v ->
-      solveL offset v (foldr (uncurry TRecordField) final unmatched')
+      solveL ctx v (foldr (uncurry TRecordField) final unmatched')
 
 solveRecordTailR ::
   (HasCallStack, Monad m) =>
-  {-| Location that generated the solution.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   -- | Remaining "expected" fields
   [(Text, Type)] ->
   -- | Optional metavariable for the "actual" record's tail.
@@ -1554,22 +1529,17 @@ solveRecordTailR ::
   -- | Shared tail of the unified records
   Type ->
   InferT loc m ()
-solveRecordTailR offset unmatched rest' final = do
+solveRecordTailR ctx unmatched rest' final = do
   case rest' of
     Nothing ->
       unless (null unmatched) . throwError $
-        MissingFields offset unmatched
+        MissingFields (ucLocation ctx) unmatched
     Just v' ->
-      solveR offset (foldr (uncurry TRecordField) final unmatched) v'
+      solveR ctx (foldr (uncurry TRecordField) final unmatched) v'
 
 solveSumTailL ::
   Monad m =>
-  {-| Location that generated the solution.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   -- | Optional metavariable for the "expected" sum's tail.
   Maybe Int ->
   -- | Remaining "actual" constructors
@@ -1577,22 +1547,17 @@ solveSumTailL ::
   -- | Shared tail of the unified sums
   Type ->
   InferT loc m ()
-solveSumTailL offset rest unmatched' final =
+solveSumTailL ctx rest unmatched' final =
   case rest of
     Nothing ->
       unless (null unmatched') . throwError $
-        UnexpectedConstructors offset unmatched'
+        UnexpectedConstructors (ucLocation ctx) unmatched'
     Just v ->
-      solveL offset v (foldr (uncurry TSumConstructor) final unmatched')
+      solveL ctx v (foldr (uncurry TSumConstructor) final unmatched')
 
 solveSumTailR ::
   Monad m =>
-  {-| Location that generated the solution.
-
-  If unification fails with a type error, this source offset should inform
-  the user of where the type error occurred.
-  -}
-  loc ->
+  UnifyContext loc ->
   -- | Remaining "expected" constructors
   [(Text, [Type])] ->
   -- | Optional metavariable for the "actual" sum's tail.
@@ -1600,13 +1565,13 @@ solveSumTailR ::
   -- | Shared tail of the unified sums
   Type ->
   InferT loc m ()
-solveSumTailR offset unmatched rest' final = do
+solveSumTailR ctx unmatched rest' final = do
   case rest' of
     Nothing ->
       unless (null unmatched) . throwError $
-        MissingConstructors offset unmatched
+        MissingConstructors (ucLocation ctx) unmatched
     Just v' ->
-      solveR offset (foldr (uncurry TSumConstructor) final unmatched) v'
+      solveR ctx (foldr (uncurry TSumConstructor) final unmatched) v'
 
 zonkNoDefault ::
   Monad m =>

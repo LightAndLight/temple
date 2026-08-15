@@ -51,6 +51,7 @@ import Temple
   , runInferT
   , symbolic
   , templateParser
+  , ucLocation
   )
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
@@ -194,10 +195,10 @@ typeError (ArityMismatch offset expected actual) =
             ++ " arguments, got "
             ++ show actual
       )
-typeError (KindMismatch offset expected actual) =
+typeError (KindMismatch ctx expected actual) =
   SingleReport $
     Diagnostic.emit
-      (Diagnostic.Offset $ getOffset offset)
+      (Diagnostic.Offset . getOffset $ ucLocation ctx)
       Diagnostic.Caret
       ( fromString $
           "expected kind "

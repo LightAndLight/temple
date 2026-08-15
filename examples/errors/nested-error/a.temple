@@ -1,0 +1,3 @@
+{{*x.a}}
+{{*x.b}}
+{% include "b.temple" with x = { x = x } %}
