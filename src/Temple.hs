@@ -1630,24 +1630,24 @@ newtype Fn = Fn ([Value] -> Value)
 instance Show Fn where
   show _ = "<function>"
 
-valueBool :: Value -> Bool
+valueBool :: HasCallStack => Value -> Bool
 valueBool VTrue = True
 valueBool VFalse = False
 valueBool v = error $ "expected bool, got " ++ show v
 
-valueString :: Value -> LazyByteString
+valueString :: HasCallStack => Value -> LazyByteString
 valueString (VString s) = s
 valueString v = error $ "expected string, got " ++ show v
 
-valueRecord :: Value -> Map Text Value
+valueRecord :: HasCallStack => Value -> Map Text Value
 valueRecord (VRecord r) = r
 valueRecord v = error $ "expected record, got " ++ show v
 
-valueStream :: Value -> [Value]
+valueStream :: HasCallStack => Value -> [Value]
 valueStream (VStream s) = s
 valueStream v = error $ "expected stream, got " ++ show v
 
-valueFn :: Value -> [Value] -> Value
+valueFn :: HasCallStack => Value -> [Value] -> Value
 valueFn (VFn (Fn f)) = f
 valueFn v = error $ "expected function, got " ++ show v
 
