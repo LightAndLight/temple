@@ -126,7 +126,7 @@ import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Data.Text.Read as Text.Read
 import qualified Data.Tuple as Tuple
-import GHC.Stack (HasCallStack)
+import GHC.Stack (HasCallStack, withFrozenCallStack)
 import Text.Sage (Parser, char, notFollowedBy, satisfy, sepBy, skipMany, string, try, (<?>))
 import qualified Text.Sage as Sage
 
@@ -1673,7 +1673,7 @@ defaultEvalEnv currentTemplate dependencies =
 defaultCtx :: Map Text Value
 defaultCtx = fmap fst builtins
 
-evalTemplate :: EvalEnv loc -> Template loc -> LazyByteString
+evalTemplate :: HasCallStack => EvalEnv loc -> Template loc -> LazyByteString
 evalTemplate env (TemplateBase parts) =
   foldMap (evalPart env) parts
 evalTemplate env (TemplateChild parent pragmas) =
@@ -1684,7 +1684,8 @@ evalTemplate env (TemplateChild parent pragmas) =
         Map.lookup parentRef (eeDependencies env)
     !ctx' = Map.fromList $ foldMap (evalPragma env) pragmas
   in
-    evalTemplate env{eeCurrentTemplate = parentRef, eeScope = ctx' <> eeScope env} template
+    withFrozenCallStack
+      (evalTemplate env{eeCurrentTemplate = parentRef, eeScope = ctx' <> eeScope env} template)
 
 evalPragma :: EvalEnv loc -> Pragma loc -> [(Text, Value)]
 evalPragma env (PragmaBlock name parts) =
@@ -1719,7 +1720,7 @@ evalPart env (PartInclude ref mWith) =
         Map.lookup includeRef $
           eeDependencies env
   in
-    evalTemplate env{eeCurrentTemplate = includeRef, eeScope = scope} template
+    withFrozenCallStack (evalTemplate env{eeCurrentTemplate = includeRef, eeScope = scope} template)
 
 evalExpr :: EvalEnv loc -> Expr loc -> Value
 evalExpr env (Var v) =
