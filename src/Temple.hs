@@ -1478,7 +1478,7 @@ solveL ctx v ty' = do
         KindMismatch ctx expectedKind actualKind
       case metaSolution meta of
         Nothing -> InferT . modify $ \s -> s{isMetavars = IntMap.insert v meta{metaSolution = Just ty'} (isMetavars s)}
-        Just ty -> unifyWithContext ctx{ucExpected = ty} ty ty'
+        Just ty -> unifyWithContext ctx ty ty'
 
 solveR ::
   (HasCallStack, Monad m) =>
@@ -1499,7 +1499,7 @@ solveR ctx ty v = do
         KindMismatch ctx expectedKind actualKind
       case metaSolution meta' of
         Nothing -> InferT . modify $ \s -> s{isMetavars = IntMap.insert v meta'{metaSolution = Just ty} (isMetavars s)}
-        Just ty' -> unifyWithContext ctx{ucActual = ty'} ty ty'
+        Just ty' -> unifyWithContext ctx ty ty'
 
 solveRecordTailL ::
   (HasCallStack, Monad m) =>
