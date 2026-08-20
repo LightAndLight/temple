@@ -1675,7 +1675,7 @@ defaultCtx = fmap fst builtins
 
 evalTemplate :: HasCallStack => EvalEnv loc -> Template loc -> LazyByteString
 evalTemplate env (TemplateBase parts) =
-  foldMap (evalPart env) parts
+  foldMap (\part -> withFrozenCallStack (evalPart env part)) parts
 evalTemplate env (TemplateChild parent pragmas) =
   let
     parentRef = locatedVal parent
@@ -1690,13 +1690,13 @@ evalTemplate env (TemplateChild parent pragmas) =
 evalPragma :: EvalEnv loc -> Pragma loc -> [(Text, Value)]
 evalPragma env (PragmaBlock name parts) =
   let
-    !value = VString $! foldMap (evalPart env) parts
+    !value = VString $! foldMap (\part -> withFrozenCallStack (evalPart env part)) parts
   in
     [(locatedVal name, value)]
 evalPragma env (PragmaWith vars) =
   [(locatedVal name, value) | (name, expr) <- vars, let !value = evalExpr env (locatedVal expr)]
 
-evalPart :: EvalEnv loc -> Part loc -> LazyByteString
+evalPart :: HasCallStack => EvalEnv loc -> Part loc -> LazyByteString
 evalPart _env (PartText t) =
   Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict t
 evalPart env (PartExpr e) =
@@ -1730,9 +1730,9 @@ evalExpr env (Var v) =
 evalExpr _env (Bool b) =
   if b then VTrue else VFalse
 evalExpr env (String parts) =
-  VString $! foldMap (evalPart env) parts
+  VString $! foldMap (\part -> withFrozenCallStack (evalPart env part)) parts
 evalExpr env (MultilineString parts) =
-  VString $! foldMap (evalPart env) parts
+  VString $! foldMap (\part -> withFrozenCallStack (evalPart env part)) parts
 evalExpr env (Call name args) =
   let
     !f = valueFn $ evalExpr env (Var $ locatedVal name)
