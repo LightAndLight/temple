@@ -1682,27 +1682,30 @@ evalTemplate env (TemplateChild parent pragmas) =
     template =
       fromMaybe (error $ "missing dependency: " ++ show parentRef) $
         Map.lookup parentRef (eeDependencies env)
-    !ctx' = Map.fromList $ foldMap (evalPragma env) pragmas
+    !ctx' = Map.fromList $ foldMap (\pragma -> withFrozenCallStack (evalPragma env pragma)) pragmas
   in
     withFrozenCallStack
       (evalTemplate env{eeCurrentTemplate = parentRef, eeScope = ctx' <> eeScope env} template)
 
-evalPragma :: EvalEnv loc -> Pragma loc -> [(Text, Value)]
+evalPragma :: HasCallStack => EvalEnv loc -> Pragma loc -> [(Text, Value)]
 evalPragma env (PragmaBlock name parts) =
   let
     !value = VString $! foldMap (\part -> withFrozenCallStack (evalPart env part)) parts
   in
     [(locatedVal name, value)]
 evalPragma env (PragmaWith vars) =
-  [(locatedVal name, value) | (name, expr) <- vars, let !value = evalExpr env (locatedVal expr)]
+  [ (locatedVal name, value)
+  | (name, expr) <- vars
+  , let !value = withFrozenCallStack (evalExpr env (locatedVal expr))
+  ]
 
 evalPart :: HasCallStack => EvalEnv loc -> Part loc -> LazyByteString
 evalPart _env (PartText t) =
   Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict t
 evalPart env (PartExpr e) =
-  valueString $ evalExpr env (locatedVal e)
+  valueString $ withFrozenCallStack (evalExpr env (locatedVal e))
 evalPart env (PartExprStream e) =
-  foldMap valueString . valueStream $ evalExpr env (locatedVal e)
+  foldMap valueString . valueStream $ withFrozenCallStack (evalExpr env (locatedVal e))
 evalPart env (PartInclude ref mWith) =
   let
     includeRef = locatedVal ref
@@ -1712,7 +1715,9 @@ evalPart env (PartInclude ref mWith) =
           eeScope env
         Just bindings ->
           Map.fromList
-            [ (locatedVal name, value) | (name, expr) <- bindings, let !value = evalExpr env (locatedVal expr)
+            [ (locatedVal name, value)
+            | (name, expr) <- bindings
+            , let !value = withFrozenCallStack (evalExpr env (locatedVal expr))
             ]
             <> eeScope env
     template =
@@ -1722,7 +1727,7 @@ evalPart env (PartInclude ref mWith) =
   in
     withFrozenCallStack (evalTemplate env{eeCurrentTemplate = includeRef, eeScope = scope} template)
 
-evalExpr :: EvalEnv loc -> Expr loc -> Value
+evalExpr :: HasCallStack => EvalEnv loc -> Expr loc -> Value
 evalExpr env (Var v) =
   case Map.lookup v $ eeScope env of
     Nothing -> error $ "not in scope: " ++ Text.unpack v
@@ -1735,15 +1740,17 @@ evalExpr env (MultilineString parts) =
   VString $! foldMap (\part -> withFrozenCallStack (evalPart env part)) parts
 evalExpr env (Call name args) =
   let
-    !f = valueFn $ evalExpr env (Var $ locatedVal name)
-    !args' = fmap (evalExpr env . locatedVal) args
+    !f = valueFn $ withFrozenCallStack (evalExpr env (Var $ locatedVal name))
+    !args' = fmap (\arg -> withFrozenCallStack (evalExpr env $ locatedVal arg)) args
   in
     f args'
 evalExpr env (Record fields) =
-  VRecord $! Map.fromList ((fmap . fmap) (evalExpr env . locatedVal) fields)
+  VRecord $!
+    Map.fromList
+      ((fmap . fmap) (\field -> withFrozenCallStack (evalExpr env $ locatedVal field)) fields)
 evalExpr env (Field expr field) =
   let
-    record = valueRecord $ evalExpr env (locatedVal expr)
+    record = valueRecord $ withFrozenCallStack (evalExpr env (locatedVal expr))
     field' =
       case field of
         FStatic f ->
@@ -1752,7 +1759,7 @@ evalExpr env (Field expr field) =
           Text.Encoding.decodeUtf8
             . LazyByteString.toStrict
             . valueString
-            $ evalExpr env (locatedVal e)
+            $ withFrozenCallStack (evalExpr env (locatedVal e))
   in
     case Map.lookup field' record of
       Nothing ->
@@ -1766,12 +1773,12 @@ evalExpr env (Field expr field) =
         value
 evalExpr env (Constructor name args) =
   let
-    !args' = fmap (evalExpr env . locatedVal) args
+    !args' = fmap (\arg -> withFrozenCallStack (evalExpr env $ locatedVal arg)) args
   in
     VConstructor name args'
 evalExpr env (Match e bs) =
   let
-    v = evalExpr env (locatedVal e)
+    v = withFrozenCallStack (evalExpr env (locatedVal e))
     (bindings, body) =
       foldr
         ( \(Branch pattern body') rest ->
@@ -1782,18 +1789,21 @@ evalExpr env (Match e bs) =
         (error "pattern match failure")
         bs
   in
-    evalExpr env{eeScope = bindings <> eeScope env} (locatedVal body)
+    withFrozenCallStack (evalExpr env{eeScope = bindings <> eeScope env} (locatedVal body))
 evalExpr env (IfThenElse cond t e) =
-  if valueBool $ evalExpr env (locatedVal cond)
-    then evalExpr env (locatedVal t)
-    else evalExpr env (locatedVal e)
+  if valueBool $ withFrozenCallStack (evalExpr env (locatedVal cond))
+    then withFrozenCallStack (evalExpr env (locatedVal t))
+    else withFrozenCallStack (evalExpr env (locatedVal e))
 evalExpr env (Array items) =
-  VStream [evalExpr env (locatedVal item) | item <- items]
+  VStream [withFrozenCallStack (evalExpr env (locatedVal item)) | item <- items]
 evalExpr env (For name xs yield) =
   let
-    xs' = valueStream $ evalExpr env (locatedVal xs)
+    xs' = valueStream $ withFrozenCallStack (evalExpr env (locatedVal xs))
   in
-    VStream [evalExpr env{eeScope = Map.insert name x' $ eeScope env} (locatedVal yield) | x' <- xs']
+    VStream
+      [ withFrozenCallStack (evalExpr env{eeScope = Map.insert name x' $ eeScope env} (locatedVal yield))
+      | x' <- xs'
+      ]
 
 match :: Pattern -> Value -> Maybe (Map Text Value)
 match (PConstructor name args) v =
