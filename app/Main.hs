@@ -411,7 +411,7 @@ apply file args = do
             Right (_state, ()) ->
               pure (bindingName binding, argValue arg)
             Left err -> do
-              let renderTemplateRef ref = error $ "impossible template reference: " ++ show ref ++ "(includes are disabled)"
+              let renderTemplateRef (TemplateRef ref) = ref
               let readTemplateRef (TemplateRef _ref) = pure $ fromString argPlain
               displayMultiReport
                 renderTemplateRef
